@@ -10,10 +10,6 @@ specified by the [IETF]. It provides a low level API for processing QUIC packets
 and handling connection state. The application is responsible for providing I/O
 (e.g. sockets handling) as well as an event loop with support for timers.
 
-Note that it is very experimental and unstable software, and many features are
-still in development. Refer to the [Status](#status) section to see what is
-currently implemented.
-
 A live QUIC server based on quiche is available at ``https://quic.tech:4433/``
 to be used for experimentation.
 
@@ -34,7 +30,7 @@ The first step in establishing a QUIC connection using quiche is creating a
 configuration object:
 
 ```rust
-let config = quiche::Config::new(quiche::VERSION_DRAFT18).unwrap();
+let config = quiche::Config::new(quiche::PROTOCOL_VERSION)?;
 ```
 
 This is shared among multiple connections and can be used to configure a
@@ -45,10 +41,10 @@ a new connection, while [`accept()`] is for servers:
 
 ```rust
 // Client connection.
-let conn = quiche::connect(Some(&server_name), &scid, &mut config).unwrap();
+let conn = quiche::connect(Some(&server_name), &scid, &mut config)?;
 
 // Server connection.
-let conn = quiche::accept(&scid, None, &mut config).unwrap();
+let conn = quiche::accept(&scid, None, &mut config)?;
 ```
 
 ### Handling incoming packets
@@ -148,7 +144,7 @@ Data can be sent on a stream by using the [`stream_send()`] method:
 ```rust
 if conn.is_established() {
     // Handshake completed, send some data on stream 0.
-    conn.stream_send(0, b"hello", true).unwrap();
+    conn.stream_send(0, b"hello", true)?;
 }
 ```
 
@@ -175,8 +171,8 @@ if conn.is_established() {
 
 ### HTTP/3
 
-The quiche [HTTP/3 module] provides a high level API for sending and receiving
-HTTP requests and responses on top of the QUIC transport protocol.
+The quiche [HTTP/3 module] provides a high level API for sending and
+receiving HTTP requests and responses on top of the QUIC transport protocol.
 
 [`connect()`]: https://docs.quic.tech/quiche/fn.connect.html
 [`accept()`]: https://docs.quic.tech/quiche/fn.accept.html
@@ -212,28 +208,32 @@ be linked directly into C/C++ applications.
 Building
 --------
 
-The first step after cloning the git repo is updating the git submodules:
+quiche requires Rust 1.35 or later to build. The latest stable Rust release can
+be installed using [rustup](https://rustup.rs/).
+
+Once the Rust build environment is setup, the quiche source code can be fetched
+using git:
 
 ```bash
- $ git submodule update --init
+ $ git clone --recursive https://github.com/cloudflare/quiche
 ```
 
-You can now build quiche using cargo:
+and then built using cargo:
 
 ```bash
  $ cargo build --examples
 ```
 
-As well as run its tests:
+cargo can also be used to run the testsuite:
 
 ```bash
  $ cargo test
 ```
 
-Note that [BoringSSL], used to implement QUIC's cryptographic handshake based on
-TLS, needs to be built and linked to quiche. This is done automatically when
-building quiche using cargo, but requires the `cmake` and `go` commands to be
-available during the build process.
+Note that [BoringSSL], which is used to implement QUIC's cryptographic handshake
+based on TLS, needs to be built and linked to quiche. This is done automatically
+when building quiche using cargo, but requires the `cmake` and `go` commands to
+be available during the build process.
 
 In alternative you can use your own custom build of BoringSSL by configuring
 the BoringSSL directory with the ``QUICHE_BSSL_PATH`` environment variable:
@@ -243,6 +243,83 @@ the BoringSSL directory with the ``QUICHE_BSSL_PATH`` environment variable:
 ```
 
 [BoringSSL]: https://boringssl.googlesource.com/boringssl/
+
+### Building for Android
+
+To build quiche for Android, you need the following:
+
+- Install Android NDK (13b or higher), using Android Studio or directly.
+- Set `ANDROID_NDK_HOME` environment variable to NDK path, e.g. using bash:
+
+```bash
+ $ export ANDROID_NDK_HOME=/usr/local/share/android-ndk
+```
+
+- Install the Rust toolchain for Android architectures:
+
+```bash
+ $ rustup target add aarch64-linux-android arm-linux-androideabi armv7-linux-androideabi i686-linux-android
+```
+
+Then, to prepare the cross-compiling toolchain, run the following command:
+
+```bash
+ $ tools/setup_android.sh
+```
+
+It will create a standalone toolchain for arm64/arm/x86 architectures under the
+`$TOOLCHAIN_DIR/arch` directory. If you didn't set `TOOLCHAIN_DIR` environment
+variable, the current directory will be used. Note that the minimum API level is
+21 for all target architectures.
+
+After it run successfully, run the following script to build libquiche:
+
+```bash
+ $ tools/build_android.sh
+```
+
+It will build binaries for aarch64, armv7 and i686. You can pass parameters to
+this script for cargo build. For example if you want to build a release binary
+with verbose logs, do the following:
+
+```bash
+ $ tools/build_android.sh --release -vv
+```
+
+### Building for iOS
+
+To build quiche for iOS, you need the following:
+
+- Install Xcode command-line tools. You can install them with Xcode or with the
+  following command:
+
+```bash
+ $ xcode-select --install
+```
+
+- Install the Rust toolchain for iOS architectures:
+
+```bash
+ $ rustup target add aarch64-apple-ios armv7-apple-ios armv7s-apple-ios x86_64-apple-ios i386-apple-ios
+```
+
+- Install `cargo-lipo`:
+
+```bash
+ $ cargo install cargo-lipo
+```
+
+To build libquiche, run the following command:
+
+```bash
+ $ cargo lipo
+```
+
+or
+
+```bash
+ $ cargo lipo --release
+```
 
 Copyright
 ---------

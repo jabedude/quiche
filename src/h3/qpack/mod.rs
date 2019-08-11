@@ -57,7 +57,7 @@ pub enum Error {
 
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "{}", self)
+        write!(f, "{:?}", self)
     }
 }
 
@@ -71,18 +71,14 @@ impl std::error::Error for Error {
         }
     }
 
-    fn cause(&self) -> Option<&std::error::Error> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         None
     }
 }
 
-impl std::convert::From<crate::Error> for Error {
-    fn from(err: crate::Error) -> Self {
-        match err {
-            crate::Error::BufferTooShort => Error::BufferTooShort,
-
-            _ => unreachable!(),
-        }
+impl std::convert::From<crate::octets::BufferTooShortError> for Error {
+    fn from(_err: crate::octets::BufferTooShortError) -> Self {
+        Error::BufferTooShort
     }
 }
 

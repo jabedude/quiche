@@ -24,6 +24,7 @@
 // NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 // SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -71,7 +72,7 @@ static void flush_egress(struct ev_loop *loop, struct conn_io *conn_io) {
         }
 
         if (written < 0) {
-            fprintf(stderr, "failed to create packet: %ld\n", written);
+            fprintf(stderr, "failed to create packet: %zd\n", written);
             return;
         }
 
@@ -81,7 +82,7 @@ static void flush_egress(struct ev_loop *loop, struct conn_io *conn_io) {
             return;
         }
 
-        fprintf(stderr, "sent %lu bytes\n", sent);
+        fprintf(stderr, "sent %zd bytes\n", sent);
     }
 
     double t = quiche_conn_timeout_as_nanos(conn_io->conn) / 1e9f;
@@ -89,11 +90,13 @@ static void flush_egress(struct ev_loop *loop, struct conn_io *conn_io) {
     ev_timer_again(loop, &conn_io->timer);
 }
 
-static void for_each_header(uint8_t *name, size_t name_len,
-                            uint8_t *value, size_t value_len,
-                            void *argp) {
+static int for_each_header(uint8_t *name, size_t name_len,
+                           uint8_t *value, size_t value_len,
+                           void *argp) {
     fprintf(stderr, "got HTTP header: %.*s=%.*s\n",
             (int) name_len, name, (int) value_len, value);
+
+    return 0;
 }
 
 static void recv_cb(EV_P_ ev_io *w, int revents) {
@@ -124,11 +127,11 @@ static void recv_cb(EV_P_ ev_io *w, int revents) {
         }
 
         if (done < 0) {
-            fprintf(stderr, "failed to process packet: %ld\n", done);
+            fprintf(stderr, "failed to process packet: %zd\n", done);
             return;
         }
 
-        fprintf(stderr, "recv %lu bytes\n", done);
+        fprintf(stderr, "recv %zd bytes\n", done);
     }
 
     if (quiche_conn_is_closed(conn_io->conn)) {
@@ -139,7 +142,7 @@ static void recv_cb(EV_P_ ev_io *w, int revents) {
     }
 
     if (quiche_conn_is_established(conn_io->conn) && !req_sent) {
-        uint8_t *app_proto;
+        const uint8_t *app_proto;
         size_t app_proto_len;
 
         quiche_conn_application_proto(conn_io->conn, &app_proto, &app_proto_len);
@@ -162,18 +165,52 @@ static void recv_cb(EV_P_ ev_io *w, int revents) {
         quiche_h3_config_free(config);
 
         quiche_h3_header headers[] = {
-            { ":method", "GET" },
-            { ":scheme", "https" },
-            { ":authority", "quich.tech" },
-            { ":path", "/" },
-            { "user-agent", "quiche" },
+            {
+                .name = (const uint8_t *) ":method",
+                .name_len = sizeof(":method") - 1,
+
+                .value = (const uint8_t *) "GET",
+                .value_len = sizeof("GET") - 1,
+            },
+
+            {
+                .name = (const uint8_t *) ":scheme",
+                .name_len = sizeof(":scheme") - 1,
+
+                .value = (const uint8_t *) "https",
+                .value_len = sizeof("https") - 1,
+            },
+
+            {
+                .name = (const uint8_t *) ":authority",
+                .name_len = sizeof(":authority") - 1,
+
+                .value = (const uint8_t *) "quich.tech",
+                .value_len = sizeof("quich.tech") - 1,
+            },
+
+            {
+                .name = (const uint8_t *) ":path",
+                .name_len = sizeof(":path") - 1,
+
+                .value = (const uint8_t *) "/",
+                .value_len = sizeof("/") - 1,
+            },
+
+            {
+                .name = (const uint8_t *) "user-agent",
+                .name_len = sizeof("user-agent") - 1,
+
+                .value = (const uint8_t *) "quiche",
+                .value_len = sizeof("quiche") - 1,
+            },
         };
 
         int64_t stream_id = quiche_h3_send_request(conn_io->http3,
                                                    conn_io->conn,
                                                    headers, 5, true);
 
-        fprintf(stderr, "sent HTTP request %zu\n", stream_id);
+        fprintf(stderr, "sent HTTP request %" PRId64 "\n", stream_id);
 
         req_sent = true;
     }
@@ -191,23 +228,34 @@ static void recv_cb(EV_P_ ev_io *w, int revents) {
             }
 
             switch (quiche_h3_event_type(ev)) {
-                case QUICHE_H3_EVENT_HEADERS:
-                    quiche_h3_event_for_each_header(ev, for_each_header, NULL);
+                case QUICHE_H3_EVENT_HEADERS: {
+                    int rc = quiche_h3_event_for_each_header(ev, for_each_header,
+                                                             NULL);
+
+                    if (rc != 0) {
+                        fprintf(stderr, "failed to process headers");
+                    }
+
                     break;
+                }
 
                 case QUICHE_H3_EVENT_DATA: {
-                    uint8_t *data;
-                    size_t len = quiche_h3_event_data(ev, &data);
+                    ssize_t len = quiche_h3_recv_body(conn_io->http3,
+                                                      conn_io->conn, s,
+                                                      buf, sizeof(buf));
+                    if (len <= 0) {
+                        break;
+                    }
 
-                    printf("%.*s", (int) len, data);
+                    printf("%.*s", (int) len, buf);
                     break;
                 }
-            }
 
-            if (quiche_conn_stream_finished(conn_io->conn, s)) {
-                if (quiche_conn_close(conn_io->conn, true, 0, NULL, 0) < 0) {
-                    fprintf(stderr, "failed to close connection\n");
-                }
+                case QUICHE_H3_EVENT_FINISHED:
+                    if (quiche_conn_close(conn_io->conn, true, 0, NULL, 0) < 0) {
+                        fprintf(stderr, "failed to close connection\n");
+                    }
+                    break;
             }
 
             quiche_h3_event_free(ev);
@@ -226,14 +274,12 @@ static void timeout_cb(EV_P_ ev_timer *w, int revents) {
     flush_egress(loop, conn_io);
 
     if (quiche_conn_is_closed(conn_io->conn)) {
-        uint64_t sent, lost, rtt;
+        quiche_stats stats;
 
-        quiche_conn_stats_sent(conn_io->conn, &sent);
-        quiche_conn_stats_lost(conn_io->conn, &lost);
-        quiche_conn_stats_rtt_as_nanos(conn_io->conn, &rtt);
+        quiche_conn_stats(conn_io->conn, &stats);
 
-        fprintf(stderr, "connection closed, sent=%ld lost=%ld rtt=%ldns\n",
-                sent, lost, rtt);
+        fprintf(stderr, "connection closed, recv=%zu sent=%zu lost=%zu rtt=%" PRIu64 "ns\n",
+                stats.recv, stats.sent, stats.lost, stats.rtt);
 
         ev_break(EV_A_ EVBREAK_ONE);
         return;
@@ -284,7 +330,7 @@ int main(int argc, char *argv[]) {
         (uint8_t *) QUICHE_H3_APPLICATION_PROTOCOL,
         sizeof(QUICHE_H3_APPLICATION_PROTOCOL) - 1);
 
-    quiche_config_set_idle_timeout(config, 30);
+    quiche_config_set_idle_timeout(config, 5000);
     quiche_config_set_max_packet_size(config, MAX_DATAGRAM_SIZE);
     quiche_config_set_initial_max_data(config, 10000000);
     quiche_config_set_initial_max_stream_data_bidi_local(config, 1000000);
@@ -293,6 +339,10 @@ int main(int argc, char *argv[]) {
     quiche_config_set_initial_max_streams_bidi(config, 100);
     quiche_config_set_initial_max_streams_uni(config, 100);
     quiche_config_set_disable_migration(config, true);
+
+    if (getenv("SSLKEYLOGFILE")) {
+      quiche_config_log_keys(config);
+    }
 
     // ABC: old config creation here
 

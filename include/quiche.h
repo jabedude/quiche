@@ -39,10 +39,13 @@ extern "C" {
 //
 
 // The current QUIC wire version.
-#define QUICHE_VERSION_DRAFT18 0xff000012
+#define QUICHE_PROTOCOL_VERSION 0xff000016
 
 // The maximum length of a connection ID.
-#define QUICHE_MAX_CONN_ID_LEN 18
+#define QUICHE_MAX_CONN_ID_LEN 20
+
+// The minimum length of Initial packets sent by a client.
+#define QUICHE_MIN_CLIENT_INITIAL_LEN 1200
 
 enum quiche_error {
     // There is no more work to do.
@@ -88,6 +91,9 @@ enum quiche_error {
     QUICHE_ERR_FINAL_SIZE = -13,
 };
 
+// Returns a human readable string with the quiche version number.
+const char *quiche_version(void);
+
 // Enables logging. |cb| will be called with log messages
 void quiche_enable_debug_logging(void (*cb)(const char *line, void *argp),
                                  void *argp);
@@ -117,7 +123,7 @@ void quiche_config_log_keys(quiche_config *config);
 
 // Configures the list of supported application protocols.
 int quiche_config_set_application_protos(quiche_config *config,
-                                         uint8_t *protos,
+                                         const uint8_t *protos,
                                          size_t protos_len);
 
 // Sets the `idle_timeout` transport parameter.
@@ -210,21 +216,21 @@ ssize_t quiche_conn_stream_recv(quiche_conn *conn, uint64_t stream_id,
 ssize_t quiche_conn_stream_send(quiche_conn *conn, uint64_t stream_id,
                                 const uint8_t *buf, size_t buf_len, bool fin);
 
+enum quiche_shutdown {
+    QUICHE_SHUTDOWN_READ = 0,
+    QUICHE_SHUTDOWN_WRITE = 1,
+};
+
+// Shuts down reading or writing from/to the specified stream.
+int quiche_conn_stream_shutdown(quiche_conn *conn, uint64_t stream_id,
+                                enum quiche_shutdown direction, uint64_t err);
+
 // Returns true if all the data has been read from the specified stream.
 bool quiche_conn_stream_finished(quiche_conn *conn, uint64_t stream_id);
 
-// An iterator over the streams that have outstanding data to read.
-typedef struct Readable quiche_readable;
-
-// Creates an iterator of streams that have outstanding data to read.
-quiche_readable *quiche_conn_readable(quiche_conn *conn);
-
-// Fetches the next element from the stream iterator. Returns false if the
-// iterator is empty.
-bool quiche_readable_next(quiche_readable *iter, uint64_t *stream_id);
-
-// Frees the readable object.
-void quiche_readable_free(quiche_readable *r);
+// Fetches the next stream that has outstanding data to read. Returns false if
+// there are no readable streams.
+bool quiche_readable_next(quiche_conn *conn, uint64_t *stream_id);
 
 // Returns the amount of time until the next timeout event, as nanoseconds.
 uint64_t quiche_conn_timeout_as_nanos(quiche_conn *conn);
@@ -233,12 +239,12 @@ uint64_t quiche_conn_timeout_as_nanos(quiche_conn *conn);
 void quiche_conn_on_timeout(quiche_conn *conn);
 
 // Closes the connection with the given error and reason.
-int quiche_conn_close(quiche_conn *conn, bool app, uint16_t err,
+int quiche_conn_close(quiche_conn *conn, bool app, uint64_t err,
                       const uint8_t *reason, size_t reason_len);
 
 // Returns the negotiated ALPN protocol.
-uint8_t *quiche_conn_application_proto(quiche_conn *conn, uint8_t **out,
-                                       size_t *out_len);
+void quiche_conn_application_proto(quiche_conn *conn, const uint8_t **out,
+                                   size_t *out_len);
 
 // Returns true if the connection handshake is complete.
 bool quiche_conn_is_established(quiche_conn *conn);
@@ -246,10 +252,25 @@ bool quiche_conn_is_established(quiche_conn *conn);
 // Returns true if the connection is closed.
 bool quiche_conn_is_closed(quiche_conn *conn);
 
+typedef struct {
+    // The number of QUIC packets received on this connection.
+    size_t recv;
+
+    // The number of QUIC packets sent on this connection.
+    size_t sent;
+
+    // The number of QUIC packets that were lost.
+    size_t lost;
+
+    // The estimated round-trip time of the connection (in nanoseconds).
+    uint64_t rtt;
+
+    // The size in bytes of the connection's congestion window.
+    size_t cwnd;
+} quiche_stats;
+
 // Collects and returns statistics about the connection.
-void quiche_conn_stats_sent(quiche_conn *conn, uint64_t *out);
-void quiche_conn_stats_lost(quiche_conn *conn, uint64_t *out);
-void quiche_conn_stats_rtt_as_nanos(quiche_conn *conn, uint64_t *out);
+void quiche_conn_stats(quiche_conn *conn, quiche_stats *out);
 
 // Frees the connection object.
 void quiche_conn_free(quiche_conn *conn);
@@ -259,7 +280,7 @@ void quiche_conn_free(quiche_conn *conn);
 //
 
 /// The current HTTP/3 ALPN token.
-#define QUICHE_H3_APPLICATION_PROTOCOL "\x05h3-18"
+#define QUICHE_H3_APPLICATION_PROTOCOL "\x05h3-22"
 
 // Stores configuration shared between multiple connections.
 typedef struct Http3Config quiche_h3_config;
@@ -287,6 +308,7 @@ quiche_h3_conn *quiche_h3_conn_new_with_transport(quiche_conn *quiche_conn,
 enum quiche_h3_event_type {
     QUICHE_H3_EVENT_HEADERS,
     QUICHE_H3_EVENT_DATA,
+    QUICHE_H3_EVENT_FINISHED,
 };
 
 typedef struct Http3Event quiche_h3_event;
@@ -299,21 +321,25 @@ int quiche_h3_conn_poll(quiche_h3_conn *conn, quiche_conn *quic_conn,
 enum quiche_h3_event_type quiche_h3_event_type(quiche_h3_event *ev);
 
 // Iterates over the headers in the event.
-void quiche_h3_event_for_each_header(quiche_h3_event *ev,
-                                     void (*cb)(uint8_t *name, size_t name_len,
-                                                uint8_t *value, size_t value_len,
-                                                void *argp),
-                                     void *argp);
-
-// Returns the data from the event.
-size_t quiche_h3_event_data(quiche_h3_event *ev, uint8_t **out);
+//
+// The `cb` callback will be called for each header in `ev`. If `cb` returns
+// any value other than `0`, processing will be interrupted and the value is
+// returned to the caller.
+int quiche_h3_event_for_each_header(quiche_h3_event *ev,
+                                    int (*cb)(uint8_t *name, size_t name_len,
+                                              uint8_t *value, size_t value_len,
+                                              void *argp),
+                                    void *argp);
 
 // Frees the HTTP/3 event object.
 void quiche_h3_event_free(quiche_h3_event *ev);
 
 typedef struct {
-    const char *name;
-    const char *value;
+    const uint8_t *name;
+    size_t name_len;
+
+    const uint8_t *value;
+    size_t value_len;
 } quiche_h3_header;
 
 // Sends an HTTP/3 request.
@@ -321,7 +347,7 @@ int64_t quiche_h3_send_request(quiche_h3_conn *conn, quiche_conn *quic_conn,
                                quiche_h3_header *headers, size_t headers_len,
                                bool fin);
 
-// sends an http/3 response on the specified stream.
+// Sends an HTTP/3 response on the specified stream.
 int quiche_h3_send_response(quiche_h3_conn *conn, quiche_conn *quic_conn,
                             uint64_t stream_id, quiche_h3_header *headers,
                             size_t headers_len, bool fin);
@@ -330,6 +356,10 @@ int quiche_h3_send_response(quiche_h3_conn *conn, quiche_conn *quic_conn,
 ssize_t quiche_h3_send_body(quiche_h3_conn *conn, quiche_conn *quic_conn,
                             uint64_t stream_id, uint8_t *body, size_t body_len,
                             bool fin);
+
+// Reads request or response body data into the provided buffer.
+ssize_t quiche_h3_recv_body(quiche_h3_conn *conn, quiche_conn *quic_conn,
+                            uint64_t stream_id, uint8_t *out, size_t out_len);
 
 // Frees the HTTP/3 connection object.
 void quiche_h3_conn_free(quiche_h3_conn *conn);

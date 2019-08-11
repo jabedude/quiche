@@ -27,6 +27,8 @@
 #[macro_use]
 extern crate log;
 
+use std::net::ToSocketAddrs;
+
 use ring::rand::*;
 
 const MAX_DATAGRAM_SIZE: usize = 1350;
@@ -36,15 +38,19 @@ const USAGE: &str = "Usage:
   http3-client -h | --help
 
 Options:
+  --method METHOD          Use the given HTTP request method [default: GET].
+  --body FILE              Send the given file as request body.
   --max-data BYTES         Connection-wide flow control limit [default: 10000000].
   --max-stream-data BYTES  Per-stream flow control limit [default: 1000000].
   --wire-version VERSION   The version number to send to the server [default: babababa].
   --no-verify              Don't verify server's certificate.
   --no-grease              Don't send GREASE.
+  -H --header HEADER ...   Add a request header.
+  -n --requests REQUESTS   Send the given number of identical requests [default: 1].
   -h --help                Show this screen.
 ";
 
-fn main() -> Result<(), Box<std::error::Error>> {
+fn main() {
     let mut buf = [0; 65535];
     let mut out = [0; MAX_DATAGRAM_SIZE];
 
@@ -56,41 +62,65 @@ fn main() -> Result<(), Box<std::error::Error>> {
         .and_then(|dopt| dopt.parse())
         .unwrap_or_else(|e| e.exit());
 
-    let url = url::Url::parse(args.get_str("URL"))?;
+    let max_data = args.get_str("--max-data");
+    let max_data = u64::from_str_radix(max_data, 10).unwrap();
 
-    let socket = std::net::UdpSocket::bind("0.0.0.0:0")?;
-    socket.connect(&url)?;
+    let max_stream_data = args.get_str("--max-stream-data");
+    let max_stream_data = u64::from_str_radix(max_stream_data, 10).unwrap();
 
-    let poll = mio::Poll::new()?;
+    let version = args.get_str("--wire-version");
+    let version = u32::from_str_radix(version, 16).unwrap();
+
+    let url = url::Url::parse(args.get_str("URL")).unwrap();
+
+    // Request headers (can be multiple).
+    let req_headers = args.get_vec("--header");
+
+    let reqs_count = args.get_str("--requests");
+    let reqs_count = u64::from_str_radix(reqs_count, 10).unwrap();
+
+    let mut reqs_complete = 0;
+
+    // Setup the event loop.
+    let poll = mio::Poll::new().unwrap();
     let mut events = mio::Events::with_capacity(1024);
 
-    let socket = mio::net::UdpSocket::from_socket(socket)?;
+    // Resolve server address.
+    let peer_addr = url.to_socket_addrs().unwrap().next().unwrap();
+    info!("connecting to {:}", peer_addr);
+
+    // Bind to INADDR_ANY or IN6ADDR_ANY depending on the IP family of the
+    // server address. This is needed on macOS and BSD variants that don't
+    // support binding to IN6ADDR_ANY for both v4 and v6.
+    let bind_addr = match peer_addr {
+        std::net::SocketAddr::V4(_) => "0.0.0.0:0",
+        std::net::SocketAddr::V6(_) => "[::]:0",
+    };
+
+    // Create the UDP socket backing the QUIC connection, and register it with
+    // the event loop.
+    let socket = std::net::UdpSocket::bind(bind_addr).unwrap();
+    socket.connect(peer_addr).unwrap();
+
+    let socket = mio::net::UdpSocket::from_socket(socket).unwrap();
     poll.register(
         &socket,
         mio::Token(0),
         mio::Ready::readable(),
         mio::PollOpt::edge(),
-    )?;
+    )
+    .unwrap();
 
-    let mut scid = [0; quiche::MAX_CONN_ID_LEN];
-    SystemRandom::new().fill(&mut scid[..])?;
-
-    let max_data = args.get_str("--max-data");
-    let max_data = u64::from_str_radix(max_data, 10)?;
-
-    let max_stream_data = args.get_str("--max-stream-data");
-    let max_stream_data = u64::from_str_radix(max_stream_data, 10)?;
-
-    let version = args.get_str("--wire-version");
-    let version = u32::from_str_radix(version, 16)?;
-
-    let mut config = quiche::Config::new(version)?;
+    // Create the configuration for the QUIC connection.
+    let mut config = quiche::Config::new(version).unwrap();
 
     config.verify_peer(true);
 
-    config.set_application_protos(quiche::h3::APPLICATION_PROTOCOL)?;
+    config
+        .set_application_protos(quiche::h3::APPLICATION_PROTOCOL)
+        .unwrap();
 
-    config.set_idle_timeout(30);
+    config.set_idle_timeout(5000);
     config.set_max_packet_size(MAX_DATAGRAM_SIZE as u64);
     config.set_initial_max_data(max_data);
     config.set_initial_max_stream_data_bidi_local(max_stream_data);
@@ -114,24 +144,41 @@ fn main() -> Result<(), Box<std::error::Error>> {
         config.log_keys();
     }
 
-    let mut conn = quiche::connect(url.domain(), &scid, &mut config)?;
+    // Generate a random source connection ID for the connection.
+    let mut scid = [0; quiche::MAX_CONN_ID_LEN];
+    SystemRandom::new().fill(&mut scid[..]).unwrap();
+
+    // Create a QUIC connection and initiate handshake.
+    let mut conn = quiche::connect(url.domain(), &scid, &mut config).unwrap();
 
     let write = match conn.send(&mut out) {
         Ok(v) => v,
 
-        Err(e) => panic!("{} initial send failed: {:?}", conn.trace_id(), e),
+        Err(e) => panic!("initial send failed: {:?}", e),
     };
 
-    socket.send(&out[..write])?;
+    while let Err(e) = socket.send(&out[..write]) {
+        if e.kind() == std::io::ErrorKind::WouldBlock {
+            debug!("send() would block");
+            continue;
+        }
 
-    debug!("{} written {}", conn.trace_id(), write);
+        panic!("send() failed: {:?}", e);
+    }
+
+    debug!("written {}", write);
 
     let req_start = std::time::Instant::now();
 
     loop {
-        poll.poll(&mut events, conn.timeout())?;
+        poll.poll(&mut events, conn.timeout()).unwrap();
 
+        // Read incoming UDP packets from the socket and feed them to quiche,
+        // until there are no more packets to read.
         'read: loop {
+            // If the event loop reported no events, it means that the timeout
+            // has expired, so handle it without attempting to read packets. We
+            // will then proceed with the send loop.
             if events.is_empty() {
                 debug!("timed out");
 
@@ -144,6 +191,8 @@ fn main() -> Result<(), Box<std::error::Error>> {
                 Ok(v) => v,
 
                 Err(e) => {
+                    // There are no more UDP packets to read, so end the read
+                    // loop.
                     if e.kind() == std::io::ErrorKind::WouldBlock {
                         debug!("recv() would block");
                         break 'read;
@@ -153,37 +202,39 @@ fn main() -> Result<(), Box<std::error::Error>> {
                 },
             };
 
-            debug!("{} got {} bytes", conn.trace_id(), len);
+            debug!("got {} bytes", len);
 
             // Process potentially coalesced packets.
             let read = match conn.recv(&mut buf[..len]) {
                 Ok(v) => v,
 
                 Err(quiche::Error::Done) => {
-                    debug!("{} done reading", conn.trace_id());
+                    debug!("done reading");
                     break;
                 },
 
                 Err(e) => {
-                    error!("{} recv failed: {:?}", conn.trace_id(), e);
-                    conn.close(false, e.to_wire(), b"fail").ok();
+                    error!("recv failed: {:?}", e);
                     break 'read;
                 },
             };
 
-            debug!("{} processed {} bytes", conn.trace_id(), read);
+            debug!("processed {} bytes", read);
         }
 
         if conn.is_closed() {
-            info!("{} connection closed, {:?}", conn.trace_id(), conn.stats());
+            info!("connection closed, {:?}", conn.stats());
             break;
         }
 
+        // Create a new HTTP/3 connection and end an HTTP request as soon as
+        // the QUIC connection is established.
         if conn.is_established() && http3_conn.is_none() {
-            let h3_config = quiche::h3::Config::new(0, 1024, 0, 0)?;
+            let h3_config = quiche::h3::Config::new(0, 1024, 0, 0).unwrap();
 
             let mut h3_conn =
-                quiche::h3::Connection::with_transport(&mut conn, &h3_config)?;
+                quiche::h3::Connection::with_transport(&mut conn, &h3_config)
+                    .unwrap();
 
             let mut path = String::from(url.path());
 
@@ -192,52 +243,103 @@ fn main() -> Result<(), Box<std::error::Error>> {
                 path.push_str(query);
             }
 
-            let req = vec![
-                quiche::h3::Header::new(":method", "GET"),
+            let mut req = vec![
+                quiche::h3::Header::new(":method", args.get_str("--method")),
                 quiche::h3::Header::new(":scheme", url.scheme()),
                 quiche::h3::Header::new(":authority", url.host_str().unwrap()),
                 quiche::h3::Header::new(":path", &path),
                 quiche::h3::Header::new("user-agent", "quiche"),
             ];
 
-            info!("{} sending HTTP request {:?}", conn.trace_id(), req);
+            // Add custom headers to the request.
+            for header in &req_headers {
+                let header_split: Vec<&str> = header.splitn(2, ": ").collect();
+                if header_split.len() != 2 {
+                    panic!("malformed header provided - \"{}\"", header);
+                }
 
-            if let Err(e) = h3_conn.send_request(&mut conn, &req, true) {
-                error!("{} failed to send request {:?}", conn.trace_id(), e);
-                break;
+                req.push(quiche::h3::Header::new(
+                    header_split[0],
+                    header_split[1],
+                ));
+            }
+
+            let body = if args.get_bool("--body") {
+                std::fs::read(args.get_str("--body")).ok()
+            } else {
+                None
+            };
+
+            if body.is_some() {
+                req.push(quiche::h3::Header::new(
+                    "content-length",
+                    &body.as_ref().unwrap().len().to_string(),
+                ));
+            }
+
+            for _ in 0..reqs_count {
+                info!("sending HTTP request {:?}", req);
+
+                let s =
+                    match h3_conn.send_request(&mut conn, &req, body.is_none()) {
+                        Ok(stream_id) => stream_id,
+
+                        Err(e) => {
+                            error!("failed to send request {:?}", e);
+                            break;
+                        },
+                    };
+
+                if let Some(body) = &body {
+                    if let Err(e) = h3_conn.send_body(&mut conn, s, body, true) {
+                        error!("failed to send request body {:?}", e);
+                        break;
+                    }
+                }
             }
 
             http3_conn = Some(h3_conn);
         }
 
         if let Some(http3_conn) = &mut http3_conn {
+            // Process HTTP/3 events.
             loop {
                 match http3_conn.poll(&mut conn) {
                     Ok((stream_id, quiche::h3::Event::Headers(headers))) => {
                         info!(
-                            "{} got response headers {:?} on stream id {}",
-                            conn.trace_id(),
-                            headers,
-                            stream_id
+                            "got response headers {:?} on stream id {}",
+                            headers, stream_id
                         );
                     },
 
-                    Ok((stream_id, quiche::h3::Event::Data(data))) => {
+                    Ok((stream_id, quiche::h3::Event::Data)) => {
+                        if let Ok(read) =
+                            http3_conn.recv_body(&mut conn, stream_id, &mut buf)
+                        {
+                            debug!(
+                                "got {} bytes of response data on stream {}",
+                                read, stream_id
+                            );
+
+                            print!("{}", unsafe {
+                                std::str::from_utf8_unchecked(&buf[..read])
+                            });
+                        }
+                    },
+
+                    Ok((_stream_id, quiche::h3::Event::Finished)) => {
+                        reqs_complete += 1;
+
                         debug!(
-                            "{} got response data of length {} in stream id {}",
-                            conn.trace_id(),
-                            data.len(),
-                            stream_id
+                            "{}/{} responses received",
+                            reqs_complete, reqs_count
                         );
 
-                        print!("{}", unsafe {
-                            std::str::from_utf8_unchecked(&data)
-                        });
-
-                        if conn.stream_finished(stream_id) {
+                        if reqs_complete == reqs_count {
                             info!(
-                                "{} response received in {:?}, closing...",
-                                conn.trace_id(),
+                                "{}/{} response(s) received in {:?}, closing...",
+                                reqs_complete,
+                                reqs_count,
                                 req_start.elapsed()
                             );
 
@@ -247,6 +349,8 @@ fn main() -> Result<(), Box<std::error::Error>> {
 
                                 Err(e) => panic!("error closing conn: {:?}", e),
                             }
+
+                            break;
                         }
                     },
 
@@ -255,11 +359,7 @@ fn main() -> Result<(), Box<std::error::Error>> {
                     },
 
                     Err(e) => {
-                        error!(
-                            "{} HTTP/3 processing failed: {:?}",
-                            conn.trace_id(),
-                            e
-                        );
+                        error!("HTTP/3 processing failed: {:?}", e);
 
                         break;
                     },
@@ -267,33 +367,39 @@ fn main() -> Result<(), Box<std::error::Error>> {
             }
         }
 
+        // Generate outgoing QUIC packets and send them on the UDP socket, until
+        // quiche reports that there are no more packets to be sent.
         loop {
             let write = match conn.send(&mut out) {
                 Ok(v) => v,
 
                 Err(quiche::Error::Done) => {
-                    debug!("{} done writing", conn.trace_id());
+                    debug!("done writing");
                     break;
                 },
 
                 Err(e) => {
-                    error!("{} send failed: {:?}", conn.trace_id(), e);
-                    conn.close(false, e.to_wire(), b"fail").ok();
+                    error!("send failed: {:?}", e);
+                    conn.close(false, 0x1, b"fail").ok();
                     break;
                 },
             };
 
-            // TODO: coalesce packets.
-            socket.send(&out[..write])?;
+            if let Err(e) = socket.send(&out[..write]) {
+                if e.kind() == std::io::ErrorKind::WouldBlock {
+                    debug!("send() would block");
+                    break;
+                }
 
-            debug!("{} written {}", conn.trace_id(), write);
+                panic!("send() failed: {:?}", e);
+            }
+
+            debug!("written {}", write);
         }
 
         if conn.is_closed() {
-            info!("{} connection closed, {:?}", conn.trace_id(), conn.stats());
+            info!("connection closed, {:?}", conn.stats());
             break;
         }
     }
-
-    Ok(())
 }

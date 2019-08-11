@@ -98,7 +98,7 @@ static void flush_egress(struct ev_loop *loop, struct conn_io *conn_io) {
         }
 
         if (written < 0) {
-            fprintf(stderr, "failed to create packet: %ld\n", written);
+            fprintf(stderr, "failed to create packet: %zd\n", written);
             return;
         }
 
@@ -110,7 +110,7 @@ static void flush_egress(struct ev_loop *loop, struct conn_io *conn_io) {
             return;
         }
 
-        fprintf(stderr, "sent %lu bytes\n", sent);
+        fprintf(stderr, "sent %zd bytes\n", sent);
     }
 
     double t = quiche_conn_timeout_as_nanos(conn_io->conn) / 1e9f;
@@ -195,11 +195,13 @@ static struct conn_io *create_conn(uint8_t *odcid, size_t odcid_len) {
     return conn_io;
 }
 
-static void for_each_header(uint8_t *name, size_t name_len,
-                            uint8_t *value, size_t value_len,
-                            void *argp) {
+static int for_each_header(uint8_t *name, size_t name_len,
+                           uint8_t *value, size_t value_len,
+                           void *argp) {
     fprintf(stderr, "got HTTP header: %.*s=%.*s\n",
             (int) name_len, name, (int) value_len, value);
+
+    return 0;
 }
 
 static void recv_cb(EV_P_ ev_io *w, int revents) {
@@ -253,7 +255,7 @@ static void recv_cb(EV_P_ ev_io *w, int revents) {
         HASH_FIND(hh, conns->h, dcid, dcid_len, conn_io);
 
         if (conn_io == NULL) {
-            if (version != QUICHE_VERSION_DRAFT18) {
+            if (version != QUICHE_PROTOCOL_VERSION) {
                 fprintf(stderr, "version negotiation\n");
 
                 ssize_t written = quiche_negotiate_version(scid, scid_len,
@@ -261,7 +263,7 @@ static void recv_cb(EV_P_ ev_io *w, int revents) {
                                                            out, sizeof(out));
 
                 if (written < 0) {
-                    fprintf(stderr, "failed to create vneg packet: %ld\n",
+                    fprintf(stderr, "failed to create vneg packet: %zd\n",
                             written);
                     return;
                 }
@@ -274,7 +276,7 @@ static void recv_cb(EV_P_ ev_io *w, int revents) {
                     return;
                 }
 
-                fprintf(stderr, "sent %lu bytes\n", sent);
+                fprintf(stderr, "sent %zd bytes\n", sent);
                 return;
             }
 
@@ -291,7 +293,7 @@ static void recv_cb(EV_P_ ev_io *w, int revents) {
                                                out, sizeof(out));
 
                 if (written < 0) {
-                    fprintf(stderr, "failed to create retry packet: %ld\n",
+                    fprintf(stderr, "failed to create retry packet: %zd\n",
                             written);
                     return;
                 }
@@ -304,7 +306,7 @@ static void recv_cb(EV_P_ ev_io *w, int revents) {
                     return;
                 }
 
-                fprintf(stderr, "sent %lu bytes\n", sent);
+                fprintf(stderr, "sent %zd bytes\n", sent);
                 return;
             }
 
@@ -332,11 +334,11 @@ static void recv_cb(EV_P_ ev_io *w, int revents) {
         }
 
         if (done < 0) {
-            fprintf(stderr, "failed to process packet: %ld\n", done);
+            fprintf(stderr, "failed to process packet: %zd\n", done);
             return;
         }
 
-        fprintf(stderr, "recv %lu bytes\n", done);
+        fprintf(stderr, "recv %zd bytes\n", done);
 
         if (quiche_conn_is_established(conn_io->conn)) {
             quiche_h3_event *ev;
@@ -361,12 +363,38 @@ static void recv_cb(EV_P_ ev_io *w, int revents) {
 
                 switch (quiche_h3_event_type(ev)) {
                     case QUICHE_H3_EVENT_HEADERS: {
-                        quiche_h3_event_for_each_header(ev, for_each_header, NULL);
+                        int rc = quiche_h3_event_for_each_header(ev,
+                                                                 for_each_header,
+                                                                 NULL);
+
+                        if (rc != 0) {
+                            fprintf(stderr, "failed to process headers\n");
+                        }
 
                         quiche_h3_header headers[] = {
-                            { ":status", "200" },
-                            { "server", "quiche" },
-                            { "content-length", "5" },
+                            {
+                                .name = (const uint8_t *) ":status",
+                                .name_len = sizeof(":status") - 1,
+
+                                .value = (const uint8_t *) "200",
+                                .value_len = sizeof("200") - 1,
+                            },
+
+                            {
+                                .name = (const uint8_t *) "server",
+                                .name_len = sizeof("server") - 1,
+
+                                .value = (const uint8_t *) "quiche",
+                                .value_len = sizeof("quiche") - 1,
+                            },
+
+                            {
+                                .name = (const uint8_t *) "content-length",
+                                .name_len = sizeof("content-length") - 1,
+
+                                .value = (const uint8_t *) "5",
+                                .value_len = sizeof("5") - 1,
+                            },
                         };
 
                         quiche_h3_send_response(conn_io->http3, conn_io->conn,
@@ -381,6 +409,9 @@ static void recv_cb(EV_P_ ev_io *w, int revents) {
                         fprintf(stderr, "got HTTP data\n");
                         break;
                     }
+
+                    case QUICHE_H3_EVENT_FINISHED:
+                        break;
                 }
 
                 quiche_h3_event_free(ev);
@@ -456,7 +487,7 @@ int main(int argc, char *argv[]) {
         return -1;
     }
 
-    config = quiche_config_new(QUICHE_VERSION_DRAFT18);
+    config = quiche_config_new(QUICHE_PROTOCOL_VERSION);
     if (config == NULL) {
         fprintf(stderr, "failed to create config\n");
         return -1;
@@ -469,7 +500,7 @@ int main(int argc, char *argv[]) {
         (uint8_t *) QUICHE_H3_APPLICATION_PROTOCOL,
         sizeof(QUICHE_H3_APPLICATION_PROTOCOL) - 1);
 
-    quiche_config_set_idle_timeout(config, 30);
+    quiche_config_set_idle_timeout(config, 5000);
     quiche_config_set_max_packet_size(config, MAX_DATAGRAM_SIZE);
     quiche_config_set_initial_max_data(config, 10000000);
     quiche_config_set_initial_max_stream_data_bidi_local(config, 1000000);
