@@ -44,23 +44,23 @@ pub struct StreamMap {
     streams: HashMap<u64, Stream>,
 
     /// Peer's maximum bidirectional stream count limit.
-    peer_max_streams_bidi: usize,
+    peer_max_streams_bidi: u64,
 
     /// Peer's maximum unidirectional stream count limit.
-    peer_max_streams_uni: usize,
+    peer_max_streams_uni: u64,
 
     /// Local maximum bidirectional stream count limit.
-    local_max_streams_bidi: usize,
+    local_max_streams_bidi: u64,
 
     /// Local maximum unidirectional stream count limit.
-    local_max_streams_uni: usize,
+    local_max_streams_uni: u64,
 
-    /// Queue of stream IDs corresponding to streams that have outstanding
-    /// data to send and enough flow control credits to send at least some of
-    /// it.
+    /// Queue of stream IDs corresponding to streams that have buffered data
+    /// ready to be sent to the peer. This also implies that the stream has
+    /// enough flow control credits to send at least some of that data.
     ///
     /// Streams are added to the back of the list, and removed from the front.
-    writable: VecDeque<u64>,
+    flushable: VecDeque<u64>,
 }
 
 impl StreamMap {
@@ -144,7 +144,7 @@ impl StreamMap {
                             .ok_or(Error::StreamLimit)?,
                 };
 
-                let s = Stream::new(max_rx_data as usize, max_tx_data as usize);
+                let s = Stream::new(max_rx_data, max_tx_data);
                 v.insert(s)
             },
 
@@ -154,7 +154,7 @@ impl StreamMap {
         Ok(stream)
     }
 
-    /// Pushes the stream ID to the back of the writable streams queue.
+    /// Pushes the stream ID to the back of the flushable streams queue.
     ///
     /// Note that the caller is responsible for checking that the specified
     /// stream ID was not in the queue already before calling this.
@@ -162,41 +162,47 @@ impl StreamMap {
     /// Queueing a stream multiple times simultaneously means that it might be
     /// unfairly scheduled more often than other streams, and might also cause
     /// spurious cycles through the queue, so it should be avoided.
-    pub fn push_writable(&mut self, stream_id: u64) {
-        self.writable.push_back(stream_id);
+    pub fn push_flushable(&mut self, stream_id: u64) {
+        self.flushable.push_back(stream_id);
     }
 
-    /// Removes and returns the first stream ID from the writable streams queue.
+    /// Removes and returns the first stream ID from the flushable streams
+    /// queue.
     ///
-    /// Note that if the stream is still writable after sending some of its
+    /// Note that if the stream is still flushable after sending some of its
     /// outstanding data, it needs to be added back to the queu.
-    pub fn pop_writable(&mut self) -> Option<u64> {
-        self.writable.pop_front()
+    pub fn pop_flushable(&mut self) -> Option<u64> {
+        self.flushable.pop_front()
     }
 
     /// Updates the local maximum bidirectional stream count limit.
-    pub fn update_local_max_streams_bidi(&mut self, v: usize) {
+    pub fn update_local_max_streams_bidi(&mut self, v: u64) {
         self.local_max_streams_bidi = cmp::max(self.local_max_streams_bidi, v);
     }
 
     /// Updates the local maximum unidirectional stream count limit.
-    pub fn update_local_max_streams_uni(&mut self, v: usize) {
+    pub fn update_local_max_streams_uni(&mut self, v: u64) {
         self.local_max_streams_uni = cmp::max(self.local_max_streams_uni, v);
     }
 
     /// Updates the peer's maximum bidirectional stream count limit.
-    pub fn update_peer_max_streams_bidi(&mut self, v: usize) {
+    pub fn update_peer_max_streams_bidi(&mut self, v: u64) {
         self.peer_max_streams_bidi = cmp::max(self.peer_max_streams_bidi, v);
     }
 
     /// Updates the peer's maximum unidirectional stream count limit.
-    pub fn update_peer_max_streams_uni(&mut self, v: usize) {
+    pub fn update_peer_max_streams_uni(&mut self, v: u64) {
         self.peer_max_streams_uni = cmp::max(self.peer_max_streams_uni, v);
     }
 
     /// Creates an iterator over streams that have outstanding data to read.
-    pub fn readable(&mut self) -> Readable {
-        Readable::new(&self.streams)
+    pub fn readable(&self) -> StreamIter {
+        StreamIter::new(&self.streams, Stream::readable)
+    }
+
+    /// Creates an iterator over streams that can be written to.
+    pub fn writable(&self) -> StreamIter {
+        StreamIter::new(&self.streams, Stream::writable)
     }
 
     /// Creates an iterator over all streams.
@@ -205,8 +211,8 @@ impl StreamMap {
     }
 
     /// Returns true if there are any streams that have data to write.
-    pub fn has_writable(&self) -> bool {
-        !self.writable.is_empty()
+    pub fn has_flushable(&self) -> bool {
+        !self.flushable.is_empty()
     }
 
     /// Returns true if there are any streams that need to update the local
@@ -228,7 +234,7 @@ pub struct Stream {
 
 impl Stream {
     /// Creates a new stream with the given flow control limits.
-    pub fn new(max_rx_data: usize, max_tx_data: usize) -> Stream {
+    pub fn new(max_rx_data: u64, max_tx_data: u64) -> Stream {
         Stream {
             recv: RecvBuf::new(max_rx_data),
             send: SendBuf::new(max_tx_data),
@@ -240,9 +246,17 @@ impl Stream {
         self.recv.ready()
     }
 
+    /// Returns true if the stream has enough flow control capacity to be
+    /// written to, and is not finished.
+    pub fn writable(&self) -> bool {
+        !self.send.shutdown &&
+            !self.send.is_fin() &&
+            self.send.off < self.send.max_data
+    }
+
     /// Returns true if the stream has data to send and is allowed to send at
     /// least some of it.
-    pub fn writable(&self) -> bool {
+    pub fn flushable(&self) -> bool {
         self.send.ready() && self.send.off() < self.send.max_data
     }
 }
@@ -257,34 +271,38 @@ pub fn is_bidi(stream_id: u64) -> bool {
     (stream_id & 0x2) == 0
 }
 
-/// An iterator over the streams that have outstanding data to read.
-///
-/// This can be obtained by calling a connection's [`readable()`] method.
-///
-/// [`readable()`]: struct.Connection.html#method.readable
-pub struct Readable<'a> {
-    streams: hash_map::Iter<'a, u64, Stream>,
+/// An iterator over QUIC streams.
+#[derive(Default)]
+pub struct StreamIter {
+    streams: Vec<u64>,
 }
 
-impl<'a> Readable<'a> {
-    fn new(streams: &HashMap<u64, Stream>) -> Readable {
-        Readable {
-            streams: streams.iter(),
+impl StreamIter {
+    fn new<F>(streams: &HashMap<u64, Stream>, f: F) -> StreamIter
+    where
+        F: Fn(&Stream) -> bool,
+    {
+        StreamIter {
+            streams: streams
+                .iter()
+                .filter(|(_, s)| f(s))
+                .map(|(&id, _)| id)
+                .collect(),
         }
     }
 }
 
-impl<'a> Iterator for Readable<'a> {
+impl Iterator for StreamIter {
     type Item = u64;
 
     fn next(&mut self) -> Option<Self::Item> {
-        for (id, s) in &mut self.streams {
-            if s.readable() {
-                return Some(*id);
-            }
-        }
+        self.streams.pop()
+    }
+}
 
-        None
+impl ExactSizeIterator for StreamIter {
+    fn len(&self) -> usize {
+        self.streams.len()
     }
 }
 
@@ -300,19 +318,19 @@ pub struct RecvBuf {
     data: BinaryHeap<RangeBuf>,
 
     /// The lowest data offset that has yet to be read by the application.
-    off: usize,
+    off: u64,
 
     /// The total length of data received on this stream.
-    len: usize,
+    len: u64,
 
     /// The maximum offset the peer is allowed to send us.
-    max_data: usize,
+    max_data: u64,
 
     /// The updated maximum offset the peer is allowed to send us.
-    max_data_next: usize,
+    max_data_next: u64,
 
     /// The final stream offset received from the peer, if any.
-    fin_off: Option<usize>,
+    fin_off: Option<u64>,
 
     /// Whether incoming data is validated but not buffered.
     drain: bool,
@@ -320,7 +338,7 @@ pub struct RecvBuf {
 
 impl RecvBuf {
     /// Creates a new receive buffer.
-    fn new(max_data: usize) -> RecvBuf {
+    fn new(max_data: u64) -> RecvBuf {
         RecvBuf {
             max_data,
             max_data_next: max_data,
@@ -400,12 +418,12 @@ impl RecvBuf {
 
                 // New buffer's start overlaps existing buffer.
                 if buf.off() >= b.off() && buf.off() < b.max_off() {
-                    buf = buf.split_off(b.max_off() - buf.off());
+                    buf = buf.split_off((b.max_off() - buf.off()) as usize);
                 }
 
                 // New buffer's end overlaps existing buffer.
                 if buf.off() < b.off() && buf.max_off() > b.off() {
-                    tmp_buf = Some(buf.split_off(b.off() - buf.off()));
+                    tmp_buf = Some(buf.split_off((b.off() - buf.off()) as usize));
                 }
             }
 
@@ -443,7 +461,7 @@ impl RecvBuf {
             if buf.len() > cap {
                 let new_buf = RangeBuf {
                     data: buf.data.split_off(cap),
-                    off: buf.off + cap,
+                    off: buf.off + cap as u64,
                     fin: buf.fin,
                 };
 
@@ -454,19 +472,19 @@ impl RecvBuf {
 
             out[len..len + buf.len()].copy_from_slice(&buf.data);
 
-            self.off += buf.len();
+            self.off += buf.len() as u64;
 
             len += buf.len();
             cap -= buf.len();
         }
 
-        self.max_data_next = self.max_data_next.saturating_add(len);
+        self.max_data_next = self.max_data_next.saturating_add(len as u64);
 
         Ok((len, self.is_fin()))
     }
 
     /// Resets the stream at the given offset.
-    pub fn reset(&mut self, final_size: usize) -> Result<usize> {
+    pub fn reset(&mut self, final_size: u64) -> Result<usize> {
         // Stream's size is already known, forbid changing it.
         if let Some(fin_off) = self.fin_off {
             if fin_off != final_size {
@@ -483,11 +501,11 @@ impl RecvBuf {
 
         // Return how many bytes need to be removed from the connection flow
         // control.
-        Ok(final_size - self.len)
+        Ok((final_size - self.len) as usize)
     }
 
     /// Commits the new max_data limit and returns it.
-    pub fn update_max_data(&mut self) -> usize {
+    pub fn update_max_data(&mut self) -> u64 {
         self.max_data = self.max_data_next;
 
         self.max_data
@@ -510,6 +528,9 @@ impl RecvBuf {
     }
 
     /// Returns true if the receive-side of the stream is complete.
+    ///
+    /// This happens when the stream's receive final size is known, and the
+    /// application has read all data from the stream.
     pub fn is_fin(&self) -> bool {
         if self.fin_off == Some(self.off) {
             return true;
@@ -544,16 +565,19 @@ pub struct SendBuf {
     data: BinaryHeap<RangeBuf>,
 
     /// The maximum offset of data buffered in the stream.
-    off: usize,
+    off: u64,
 
     /// The amount of data that was ever written to this stream.
-    len: usize,
+    len: u64,
 
     /// The maximum offset we are allowed to send to the peer.
-    max_data: usize,
+    max_data: u64,
 
     /// The highest contiguous ACK'd offset.
-    off_ack: usize,
+    ack_off: u64,
+
+    /// The final stream offset written to the stream, if any.
+    fin_off: Option<u64>,
 
     /// Whether the stream's send-side has been shut down.
     shutdown: bool,
@@ -561,7 +585,7 @@ pub struct SendBuf {
 
 impl SendBuf {
     /// Creates a new send buffer.
-    fn new(max_data: usize) -> SendBuf {
+    fn new(max_data: u64) -> SendBuf {
         SendBuf {
             max_data,
             ..SendBuf::default()
@@ -569,16 +593,34 @@ impl SendBuf {
     }
 
     /// Inserts the given slice of data at the end of the buffer.
-    pub fn push_slice(&mut self, data: &[u8], fin: bool) -> Result<()> {
+    ///
+    /// The number of bytes that were actually stored in the buffer is returned
+    /// (this may be lower than the size of the input buffer, in case of partial
+    /// writes).
+    pub fn push_slice(
+        &mut self, mut data: &[u8], mut fin: bool,
+    ) -> Result<usize> {
         let mut len = 0;
 
         if self.shutdown {
-            return Ok(());
+            // Since we won't write any more data anyway, pretend that we sent
+            // all data that was passed in.
+            return Ok(data.len());
         }
 
         if data.is_empty() {
             let buf = RangeBuf::from(&[], self.off, fin);
-            return self.push(buf);
+
+            return self.push(buf).map(|_| 0);
+        }
+
+        if data.len() > self.cap() {
+            // Truncate the input buffer according to the stream's capacity.
+            let len = self.cap();
+            data = &data[..len];
+
+            // We are not buffering the full input, so clear the fin flag.
+            fin = false;
         }
 
         // Split the input buffer into multiple RangeBufs. Otherwise a big
@@ -592,24 +634,40 @@ impl SendBuf {
             let buf = RangeBuf::from(chunk, self.off, fin);
             self.push(buf)?;
 
-            self.off += chunk.len();
+            self.off += chunk.len() as u64;
         }
 
-        Ok(())
+        Ok(data.len())
     }
 
     /// Inserts the given chunk of data in the buffer.
     pub fn push(&mut self, buf: RangeBuf) -> Result<()> {
+        if let Some(fin_off) = self.fin_off {
+            // Can't write past final offset.
+            if buf.max_off() > fin_off {
+                return Err(Error::FinalSize);
+            }
+
+            // Can't "undo" final offset.
+            if buf.max_off() == fin_off && !buf.fin() {
+                return Err(Error::FinalSize);
+            }
+        }
+
         if self.shutdown {
             return Ok(());
         }
 
         // Don't queue data that was already fully ACK'd.
-        if self.off_ack >= buf.max_off() {
+        if self.ack_off >= buf.max_off() {
             return Ok(());
         }
 
-        self.len += buf.len();
+        self.len += buf.len() as u64;
+
+        if buf.fin() {
+            self.fin_off = Some(buf.max_off());
+        }
 
         self.data.push(buf);
 
@@ -619,7 +677,8 @@ impl SendBuf {
     /// Returns contiguous data from the send buffer as a single `RangeBuf`.
     pub fn pop(&mut self, max_data: usize) -> Result<RangeBuf> {
         let mut out = RangeBuf::default();
-        out.data = Vec::with_capacity(cmp::min(max_data, self.len));
+        out.data =
+            Vec::with_capacity(cmp::min(max_data as u64, self.len) as usize);
 
         let mut out_len = max_data;
         let mut out_off = self.data.peek().map_or_else(|| 0, RangeBuf::off);
@@ -635,7 +694,8 @@ impl SendBuf {
             };
 
             if buf.len() > out_len || buf.max_off() >= self.max_data {
-                let new_len = cmp::min(out_len, self.max_data - buf.off());
+                let new_len =
+                    cmp::min(out_len, (self.max_data - buf.off()) as usize);
                 let new_buf = buf.split_off(new_len);
 
                 self.data.push(new_buf);
@@ -645,7 +705,7 @@ impl SendBuf {
                 out.off = buf.off;
             }
 
-            self.len -= buf.len();
+            self.len -= buf.len() as u64;
 
             out_len -= buf.len();
             out_off = buf.max_off();
@@ -659,17 +719,17 @@ impl SendBuf {
     }
 
     /// Updates the max_data limit to the given value.
-    pub fn update_max_data(&mut self, max_data: usize) {
+    pub fn update_max_data(&mut self, max_data: u64) {
         self.max_data = cmp::max(self.max_data, max_data);
     }
 
     /// Increments the ACK'd data offset.
-    pub fn ack(&mut self, off: usize, len: usize) {
+    pub fn ack(&mut self, off: u64, len: usize) {
         // Keep track of the highest contiguously ACK'd offset. This can be
         // used to avoid spurious retransmissions of data that has already
         // been ACK'd.
-        if self.off_ack == off {
-            self.off_ack += len;
+        if self.ack_off == off {
+            self.ack_off += len as u64;
         }
     }
 
@@ -680,18 +740,35 @@ impl SendBuf {
         self.data.clear();
     }
 
+    /// Returns true if the send-side of the stream is complete.
+    ///
+    /// This happens when the stream's send final size is knwon, and the
+    /// application has already written data up to that point.
+    pub fn is_fin(&self) -> bool {
+        if self.fin_off == Some(self.off) {
+            return true;
+        }
+
+        false
+    }
+
     /// Returns true if there is data to be written.
     fn ready(&self) -> bool {
         !self.data.is_empty()
     }
 
     /// Returns the lowest offset of data buffered.
-    fn off(&self) -> usize {
+    fn off(&self) -> u64 {
         match self.data.peek() {
             Some(v) => v.off(),
 
             None => self.off,
         }
+    }
+
+    /// Returns the outgoing flow control capacity.
+    pub fn cap(&self) -> usize {
+        (self.max_data - self.off) as usize
     }
 }
 
@@ -699,13 +776,13 @@ impl SendBuf {
 #[derive(Clone, Debug, Default, Eq)]
 pub struct RangeBuf {
     data: Vec<u8>,
-    off: usize,
+    off: u64,
     fin: bool,
 }
 
 impl RangeBuf {
     /// Creates a new `RangeBuf` from the given slice.
-    pub(crate) fn from(buf: &[u8], off: usize, fin: bool) -> RangeBuf {
+    pub(crate) fn from(buf: &[u8], off: u64, fin: bool) -> RangeBuf {
         RangeBuf {
             data: Vec::from(buf),
             off,
@@ -719,13 +796,13 @@ impl RangeBuf {
     }
 
     /// Returns the starting offset of `self`.
-    pub fn off(&self) -> usize {
+    pub fn off(&self) -> u64 {
         self.off
     }
 
     /// Returns the final offset of `self`.
-    pub fn max_off(&self) -> usize {
-        self.off() + self.len()
+    pub fn max_off(&self) -> u64 {
+        self.off() + self.len() as u64
     }
 
     /// Returns the length of `self`.
@@ -742,7 +819,7 @@ impl RangeBuf {
     pub fn split_off(&mut self, at: usize) -> RangeBuf {
         let buf = RangeBuf {
             data: self.data.split_off(at),
-            off: self.off + at,
+            off: self.off + at as u64,
             fin: self.fin,
         };
 
@@ -791,7 +868,7 @@ mod tests {
 
     #[test]
     fn empty_read() {
-        let mut recv = RecvBuf::new(std::usize::MAX);
+        let mut recv = RecvBuf::new(std::u64::MAX);
         assert_eq!(recv.len, 0);
 
         let mut buf = [0; 32];
@@ -857,7 +934,7 @@ mod tests {
 
     #[test]
     fn ordered_read() {
-        let mut recv = RecvBuf::new(std::usize::MAX);
+        let mut recv = RecvBuf::new(std::u64::MAX);
         assert_eq!(recv.len, 0);
 
         let mut buf = [0; 32];
@@ -894,7 +971,7 @@ mod tests {
 
     #[test]
     fn split_read() {
-        let mut recv = RecvBuf::new(std::usize::MAX);
+        let mut recv = RecvBuf::new(std::u64::MAX);
         assert_eq!(recv.len, 0);
 
         let mut buf = [0; 32];
@@ -934,7 +1011,7 @@ mod tests {
 
     #[test]
     fn incomplete_read() {
-        let mut recv = RecvBuf::new(std::usize::MAX);
+        let mut recv = RecvBuf::new(std::u64::MAX);
         assert_eq!(recv.len, 0);
 
         let mut buf = [0; 32];
@@ -962,7 +1039,7 @@ mod tests {
 
     #[test]
     fn zero_len_read() {
-        let mut recv = RecvBuf::new(std::usize::MAX);
+        let mut recv = RecvBuf::new(std::u64::MAX);
         assert_eq!(recv.len, 0);
 
         let mut buf = [0; 32];
@@ -990,7 +1067,7 @@ mod tests {
 
     #[test]
     fn past_read() {
-        let mut recv = RecvBuf::new(std::usize::MAX);
+        let mut recv = RecvBuf::new(std::u64::MAX);
         assert_eq!(recv.len, 0);
 
         let mut buf = [0; 32];
@@ -1029,7 +1106,7 @@ mod tests {
 
     #[test]
     fn fully_overlapping_read() {
-        let mut recv = RecvBuf::new(std::usize::MAX);
+        let mut recv = RecvBuf::new(std::u64::MAX);
         assert_eq!(recv.len, 0);
 
         let mut buf = [0; 32];
@@ -1060,7 +1137,7 @@ mod tests {
 
     #[test]
     fn fully_overlapping_read2() {
-        let mut recv = RecvBuf::new(std::usize::MAX);
+        let mut recv = RecvBuf::new(std::u64::MAX);
         assert_eq!(recv.len, 0);
 
         let mut buf = [0; 32];
@@ -1091,7 +1168,7 @@ mod tests {
 
     #[test]
     fn fully_overlapping_read3() {
-        let mut recv = RecvBuf::new(std::usize::MAX);
+        let mut recv = RecvBuf::new(std::u64::MAX);
         assert_eq!(recv.len, 0);
 
         let mut buf = [0; 32];
@@ -1122,7 +1199,7 @@ mod tests {
 
     #[test]
     fn fully_overlapping_read_multi() {
-        let mut recv = RecvBuf::new(std::usize::MAX);
+        let mut recv = RecvBuf::new(std::u64::MAX);
         assert_eq!(recv.len, 0);
 
         let mut buf = [0; 32];
@@ -1159,7 +1236,7 @@ mod tests {
 
     #[test]
     fn overlapping_start_read() {
-        let mut recv = RecvBuf::new(std::usize::MAX);
+        let mut recv = RecvBuf::new(std::u64::MAX);
         assert_eq!(recv.len, 0);
 
         let mut buf = [0; 32];
@@ -1189,7 +1266,7 @@ mod tests {
 
     #[test]
     fn overlapping_end_read() {
-        let mut recv = RecvBuf::new(std::usize::MAX);
+        let mut recv = RecvBuf::new(std::u64::MAX);
         assert_eq!(recv.len, 0);
 
         let mut buf = [0; 32];
@@ -1219,7 +1296,7 @@ mod tests {
 
     #[test]
     fn partially_multi_overlapping_reordered_read() {
-        let mut recv = RecvBuf::new(std::usize::MAX);
+        let mut recv = RecvBuf::new(std::u64::MAX);
         assert_eq!(recv.len, 0);
 
         let mut buf = [0; 32];
@@ -1256,7 +1333,7 @@ mod tests {
 
     #[test]
     fn partially_multi_overlapping_reordered_read2() {
-        let mut recv = RecvBuf::new(std::usize::MAX);
+        let mut recv = RecvBuf::new(std::u64::MAX);
         assert_eq!(recv.len, 0);
 
         let mut buf = [0; 32];
@@ -1311,7 +1388,7 @@ mod tests {
 
     #[test]
     fn empty_write() {
-        let mut send = SendBuf::new(std::usize::MAX);
+        let mut send = SendBuf::new(std::u64::MAX);
         assert_eq!(send.len, 0);
 
         let write = send.pop(std::usize::MAX).unwrap();
@@ -1321,16 +1398,16 @@ mod tests {
 
     #[test]
     fn multi_write() {
-        let mut send = SendBuf::new(std::usize::MAX);
+        let mut send = SendBuf::new(std::u64::MAX);
         assert_eq!(send.len, 0);
 
-        let first = *b"something";
-        let second = *b"helloworld";
+        let first = b"something";
+        let second = b"helloworld";
 
-        assert!(send.push_slice(&first, false).is_ok());
+        assert!(send.push_slice(first, false).is_ok());
         assert_eq!(send.len, 9);
 
-        assert!(send.push_slice(&second, true).is_ok());
+        assert!(send.push_slice(second, true).is_ok());
         assert_eq!(send.len, 19);
 
         let write = send.pop(128).unwrap();
@@ -1342,16 +1419,16 @@ mod tests {
 
     #[test]
     fn split_write() {
-        let mut send = SendBuf::new(std::usize::MAX);
+        let mut send = SendBuf::new(std::u64::MAX);
         assert_eq!(send.len, 0);
 
-        let first = *b"something";
-        let second = *b"helloworld";
+        let first = b"something";
+        let second = b"helloworld";
 
-        assert!(send.push_slice(&first, false).is_ok());
+        assert!(send.push_slice(first, false).is_ok());
         assert_eq!(send.len, 9);
 
-        assert!(send.push_slice(&second, true).is_ok());
+        assert!(send.push_slice(second, true).is_ok());
         assert_eq!(send.len, 19);
 
         let write = send.pop(10).unwrap();
@@ -1378,17 +1455,17 @@ mod tests {
 
     #[test]
     fn resend() {
-        let mut send = SendBuf::new(std::usize::MAX);
+        let mut send = SendBuf::new(std::u64::MAX);
         assert_eq!(send.len, 0);
         assert_eq!(send.off(), 0);
 
-        let first = *b"something";
-        let second = *b"helloworld";
+        let first = b"something";
+        let second = b"helloworld";
 
-        assert!(send.push_slice(&first, false).is_ok());
+        assert!(send.push_slice(first, false).is_ok());
         assert_eq!(send.off(), 0);
 
-        assert!(send.push_slice(&second, true).is_ok());
+        assert!(send.push_slice(second, true).is_ok());
         assert_eq!(send.off(), 0);
 
         let write1 = send.pop(4).unwrap();
@@ -1445,41 +1522,56 @@ mod tests {
         let mut send = SendBuf::default();
         assert_eq!(send.len, 0);
 
-        let first = *b"something";
-        let second = *b"helloworld";
+        let first = b"something";
+        let second = b"helloworld";
 
-        assert!(send.push_slice(&first, false).is_ok());
-        assert_eq!(send.len, 9);
+        assert_eq!(send.push_slice(first, false), Ok(0));
+        assert_eq!(send.len, 0);
 
-        assert!(send.push_slice(&second, true).is_ok());
-        assert_eq!(send.len, 19);
+        assert_eq!(send.push_slice(second, true), Ok(0));
+        assert_eq!(send.len, 0);
 
         send.update_max_data(5);
+
+        assert_eq!(send.push_slice(first, false), Ok(5));
+        assert_eq!(send.len, 5);
+
+        assert_eq!(send.push_slice(second, true), Ok(0));
+        assert_eq!(send.len, 5);
 
         let write = send.pop(10).unwrap();
         assert_eq!(write.off(), 0);
         assert_eq!(write.len(), 5);
         assert_eq!(write.fin(), false);
         assert_eq!(&write[..], b"somet");
-        assert_eq!(send.len, 14);
+        assert_eq!(send.len, 0);
 
         let write = send.pop(10).unwrap();
         assert_eq!(write.off(), 0);
         assert_eq!(write.len(), 0);
         assert_eq!(write.fin(), false);
         assert_eq!(&write[..], b"");
-        assert_eq!(send.len, 14);
+        assert_eq!(send.len, 0);
 
         send.update_max_data(15);
+
+        assert_eq!(send.push_slice(&first[5..], false), Ok(4));
+        assert_eq!(send.len, 4);
+
+        assert_eq!(send.push_slice(second, true), Ok(6));
+        assert_eq!(send.len, 10);
 
         let write = send.pop(10).unwrap();
         assert_eq!(write.off(), 5);
         assert_eq!(write.len(), 10);
         assert_eq!(write.fin(), false);
         assert_eq!(&write[..], b"hinghellow");
-        assert_eq!(send.len, 4);
+        assert_eq!(send.len, 0);
 
         send.update_max_data(25);
+
+        assert_eq!(send.push_slice(&second[6..], true), Ok(4));
+        assert_eq!(send.len, 4);
 
         let write = send.pop(10).unwrap();
         assert_eq!(write.off(), 15);
@@ -1491,12 +1583,12 @@ mod tests {
 
     #[test]
     fn zero_len_write() {
-        let mut send = SendBuf::new(std::usize::MAX);
+        let mut send = SendBuf::new(std::u64::MAX);
         assert_eq!(send.len, 0);
 
-        let first = *b"something";
+        let first = b"something";
 
-        assert!(send.push_slice(&first, false).is_ok());
+        assert!(send.push_slice(first, false).is_ok());
         assert_eq!(send.len, 9);
 
         assert!(send.push_slice(&[], true).is_ok());
@@ -1668,9 +1760,9 @@ mod tests {
         let second = b"world";
         let third = b"something";
 
-        assert_eq!(stream.send.push_slice(first, false), Ok(()));
-        assert_eq!(stream.send.push_slice(second, false), Ok(()));
-        assert_eq!(stream.send.push_slice(third, false), Ok(()));
+        assert!(stream.send.push_slice(first, false).is_ok());
+        assert!(stream.send.push_slice(second, false).is_ok());
+        assert!(stream.send.push_slice(third, false).is_ok());
 
         let write = stream.send.pop(25).unwrap();
         assert_eq!(write.off(), 0);
@@ -1698,5 +1790,45 @@ mod tests {
         assert_eq!(write.len(), 5);
         assert_eq!(write.fin(), false);
         assert_eq!(write.data, b"somet");
+    }
+
+    #[test]
+    fn send_past_fin() {
+        let mut stream = Stream::new(0, 15);
+
+        let first = b"hello";
+        let second = b"world";
+        let third = b"third";
+
+        assert_eq!(stream.send.push_slice(first, false), Ok(5));
+
+        assert_eq!(stream.send.push_slice(second, true), Ok(5));
+        assert!(stream.send.is_fin());
+
+        assert_eq!(stream.send.push_slice(third, false), Err(Error::FinalSize));
+    }
+
+    #[test]
+    fn send_fin_dup() {
+        let mut stream = Stream::new(0, 15);
+
+        let first = RangeBuf::from(b"hello", 0, true);
+        let second = RangeBuf::from(b"hello", 0, true);
+
+        assert_eq!(stream.send.push(first), Ok(()));
+        assert_eq!(stream.send.push(second), Ok(()));
+    }
+
+    #[test]
+    fn send_undo_fin() {
+        let mut stream = Stream::new(0, 15);
+
+        let first = b"hello";
+        let second = RangeBuf::from(b"hello", 0, false);
+
+        assert_eq!(stream.send.push_slice(first, true), Ok(5));
+        assert!(stream.send.is_fin());
+
+        assert_eq!(stream.send.push(second), Err(Error::FinalSize));
     }
 }

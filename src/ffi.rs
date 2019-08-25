@@ -40,7 +40,7 @@ use crate::*;
 
 #[no_mangle]
 pub extern fn quiche_version() -> *const u8 {
-    static VERSION: &'static str = concat!(env!("CARGO_PKG_VERSION"), "\0");
+    static VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "\0");
     VERSION.as_ptr()
 }
 
@@ -454,6 +454,17 @@ pub extern fn quiche_conn_stream_shutdown(
 }
 
 #[no_mangle]
+pub extern fn quiche_conn_stream_capacity(
+    conn: &mut Connection, stream_id: u64,
+) -> ssize_t {
+    match conn.stream_capacity(stream_id) {
+        Ok(v) => v as ssize_t,
+
+        Err(e) => e.to_c(),
+    }
+}
+
+#[no_mangle]
 pub extern fn quiche_conn_stream_finished(
     conn: &mut Connection, stream_id: u64,
 ) -> bool {
@@ -461,15 +472,13 @@ pub extern fn quiche_conn_stream_finished(
 }
 
 #[no_mangle]
-pub extern fn quiche_readable_next(
-    conn: &mut Connection, stream_id: *mut u64,
-) -> bool {
-    if let Some(v) = conn.readable().next() {
-        unsafe { *stream_id = v };
-        return true;
-    }
+pub extern fn quiche_conn_readable(conn: &Connection) -> *mut StreamIter {
+    Box::into_raw(Box::new(conn.readable()))
+}
 
-    false
+#[no_mangle]
+pub extern fn quiche_conn_writable(conn: &Connection) -> *mut StreamIter {
+    Box::into_raw(Box::new(conn.writable()))
 }
 
 #[no_mangle]
@@ -518,6 +527,23 @@ pub extern fn quiche_conn_is_established(conn: &mut Connection) -> bool {
 #[no_mangle]
 pub extern fn quiche_conn_is_closed(conn: &mut Connection) -> bool {
     conn.is_closed()
+}
+
+#[no_mangle]
+pub extern fn quiche_stream_iter_next(
+    iter: &mut StreamIter, stream_id: *mut u64,
+) -> bool {
+    if let Some(v) = iter.next() {
+        unsafe { *stream_id = v };
+        return true;
+    }
+
+    false
+}
+
+#[no_mangle]
+pub extern fn quiche_stream_iter_free(iter: *mut StreamIter) {
+    unsafe { Box::from_raw(iter) };
 }
 
 #[repr(C)]

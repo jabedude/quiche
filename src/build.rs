@@ -1,5 +1,3 @@
-use cmake;
-
 // Additional parameters for Android build of BoringSSL.
 const CMAKE_PARAMS_ANDROID: &[(&str, &[(&str, &str)])] = &[
     ("aarch64", &[
@@ -55,12 +53,12 @@ const CMAKE_PARAMS_IOS: &[(&str, &[(&str, &str)])] = &[
     ]),
 ];
 
-/// Generate the platform-specific output path for lib
+/// Returns the platform-specific output path for lib.
 ///
 /// MSVC generator on Windows place static libs in a target sub-folder,
 /// so adjust library location based on platform and build target.
 /// See issue: https://github.com/alexcrichton/cmake-rs/issues/18
-fn platform_output_path(lib: &str) -> String {
+fn get_boringssl_platform_output_path(lib: &str) -> String {
     if cfg!(windows) {
         if cfg!(debug_assertions) {
             return format!("{}/Debug", lib);
@@ -72,9 +70,9 @@ fn platform_output_path(lib: &str) -> String {
     };
 }
 
-// Returns a new cmake::Config for building BoringSSL.
-//
-// It will add platform-specific parameters if needed.
+/// Returns a new cmake::Config for building BoringSSL.
+///
+/// It will add platform-specific parameters if needed.
 fn get_boringssl_cmake_config() -> cmake::Config {
     let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap();
     let os = std::env::var("CARGO_CFG_TARGET_OS").unwrap();
@@ -122,25 +120,60 @@ fn get_boringssl_cmake_config() -> cmake::Config {
     };
 }
 
+fn write_pkg_config() {
+    use std::io::prelude::*;
+
+    let profile = std::env::var("PROFILE").unwrap();
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+    let target_dir = format!("{}/target/{}", manifest_dir, profile);
+
+    let out_path = std::path::Path::new(&target_dir).join("quiche.pc");
+    let mut out_file = std::fs::File::create(&out_path).unwrap();
+
+    let include_dir = format!("{}/include", manifest_dir);
+    let version = std::env::var("CARGO_PKG_VERSION").unwrap();
+
+    let output = format!(
+        "# quiche
+
+includedir={}
+libdir={}
+
+Name: quiche
+Description: quiche library
+URL: https://github.com/cloudflare/quiche
+Version: {}
+Libs: -Wl,-rpath,${{libdir}} -L${{libdir}} -lquiche
+Cflags: -I${{includedir}}
+",
+        include_dir, target_dir, version
+    );
+
+    out_file.write_all(output.as_bytes()).unwrap();
+}
+
 fn main() {
-    if !cfg!(feature = "no_bssl") {
+    if cfg!(feature = "boringssl-vendored") {
         let bssl_dir = std::env::var("QUICHE_BSSL_PATH").unwrap_or_else(|_| {
             get_boringssl_cmake_config()
-                .cflag("-fPIC")
                 .build_target("bssl")
                 .build()
                 .display()
                 .to_string()
         });
 
-        let crypto_dir =
-            format!("{}/build/{}", bssl_dir, platform_output_path("crypto"));
+        let crypto_path = get_boringssl_platform_output_path("crypto");
+        let crypto_dir = format!("{}/build/{}", bssl_dir, crypto_path);
         println!("cargo:rustc-link-search=native={}", crypto_dir);
         println!("cargo:rustc-link-lib=static=crypto");
 
-        let ssl_dir =
-            format!("{}/build/{}", bssl_dir, platform_output_path("ssl"));
+        let ssl_path = get_boringssl_platform_output_path("ssl");
+        let ssl_dir = format!("{}/build/{}", bssl_dir, ssl_path);
         println!("cargo:rustc-link-search=native={}", ssl_dir);
         println!("cargo:rustc-link-lib=static=ssl");
+    }
+
+    if cfg!(feature = "pkg-config-meta") {
+        write_pkg_config();
     }
 }

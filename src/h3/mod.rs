@@ -651,10 +651,11 @@ impl Connection {
         }
 
         trace!(
-            "{} sending HEADERS of size {} on stream {}",
+            "{} tx frm HEADERS stream={} len={} fin={}",
             conn.trace_id(),
+            stream_id,
             header_block.len(),
-            stream_id
+            fin
         );
 
         conn.stream_send(
@@ -688,11 +689,31 @@ impl Connection {
             return Err(Error::WrongStream);
         }
 
+        let overhead = octets::varint_len(frame::DATA_FRAME_TYPE_ID) +
+            octets::varint_len(body.len() as u64);
+
+        let stream_cap = conn.stream_capacity(stream_id)?;
+
+        // Make sure there is enough capacity to send the frame header and at
+        // least one byte of frame payload (this to avoid sending 0-length DATA
+        // frames).
+        if stream_cap <= overhead {
+            return Err(Error::Done);
+        }
+
+        // Cap the frame payload length to the stream's capacity.
+        let body_len = std::cmp::min(body.len(), stream_cap - overhead);
+
+        // If we can't send the entire body, set the fin flag to false so the
+        // application can try again later.
+        let fin = if body_len != body.len() { false } else { fin };
+
         trace!(
-            "{} sending DATA frame of size {} on stream {}",
+            "{} tx frm DATA stream={} len={} fin={}",
             conn.trace_id(),
-            body.len(),
-            stream_id
+            stream_id,
+            body_len,
+            fin
         );
 
         conn.stream_send(
@@ -701,10 +722,10 @@ impl Connection {
             false,
         )?;
 
-        conn.stream_send(stream_id, b.put_varint(body.len() as u64)?, false)?;
+        conn.stream_send(stream_id, b.put_varint(body_len as u64)?, false)?;
 
         // Return how many bytes were written, excluding the frame header.
-        let written = conn.stream_send(stream_id, body, fin)?;
+        let written = conn.stream_send(stream_id, &body[..body_len], fin)?;
 
         // Tidy up streams.
         if fin &&
@@ -755,10 +776,8 @@ impl Connection {
     /// [`send_body()`]: struct.Connection.html#method.send_body
     /// [`close()`]: ../struct.Connection.html#method.close
     pub fn poll(&mut self, conn: &mut super::Connection) -> Result<(u64, Event)> {
-        let streams: Vec<u64> = conn.readable().collect();
-
         // Process HTTP/3 data from readable streams.
-        for s in streams {
+        for s in conn.readable() {
             trace!("{} stream id {} is readable", conn.trace_id(), s);
 
             match self.handle_stream(conn, s) {
@@ -773,7 +792,7 @@ impl Connection {
         {
             if let Some(frame) = stream.get_frame() {
                 trace!(
-                    "{} rx frm {:?} on stream {}",
+                    "{} rx frm {:?} stream={}",
                     conn.trace_id(),
                     frame,
                     stream_id
@@ -1075,11 +1094,7 @@ impl Connection {
         let mut d = [42; 128];
         let mut b = octets::Octets::with_slice(&mut d);
 
-        trace!(
-            "{} sending GREASE frames on stream id {}",
-            conn.trace_id(),
-            stream_id
-        );
+        trace!("{} tx frm GREASE stream={}", conn.trace_id(), stream_id);
 
         // Empty GREASE frame.
         conn.stream_send(stream_id, b.put_varint(grease_value())?, false)?;
@@ -1099,17 +1114,13 @@ impl Connection {
     fn open_grease_stream(&mut self, conn: &mut super::Connection) -> Result<()> {
         match self.open_uni_stream(conn, grease_value()) {
             Ok(stream_id) => {
-                trace!(
-                    "{} sending GREASE stream on stream id {}",
-                    conn.trace_id(),
-                    stream_id
-                );
+                trace!("{} open GREASE stream {}", conn.trace_id(), stream_id);
 
                 conn.stream_send(stream_id, b"GREASE is the word", false)?;
             },
 
             Err(Error::IdError) => {
-                trace!("{} sending GREASE stream was blocked", conn.trace_id(),);
+                trace!("{} GREASE stream blocked", conn.trace_id(),);
 
                 return Ok(());
             },
@@ -1203,7 +1214,7 @@ impl Connection {
                             }
 
                             trace!(
-                                "{} peer's control stream: {}",
+                                "{} open peer's control stream {}",
                                 conn.trace_id(),
                                 stream_id
                             );
@@ -1749,7 +1760,7 @@ mod tests {
 
         let (stream, req) = s.send_request(false).unwrap();
 
-        let body = s.send_body_client(stream, true).unwrap();;
+        let body = s.send_body_client(stream, true).unwrap();
 
         let mut recv_buf = vec![0; body.len()];
 
@@ -2353,6 +2364,59 @@ mod tests {
         s.advance().ok();
 
         assert_eq!(s.server.poll(&mut s.pipe.server), Err(Error::InternalError));
+    }
+
+    #[test]
+    /// Tests that DATA frames are properly truncated depending on the request
+    /// stream's outgoing flow control capacity.
+    fn stream_backpressure() {
+        let bytes = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+
+        let mut s = Session::default().unwrap();
+        s.handshake().unwrap();
+
+        let (stream, req) = s.send_request(false).unwrap();
+
+        let total_data_frames = 6;
+
+        for _ in 0..total_data_frames {
+            assert_eq!(
+                s.client
+                    .send_body(&mut s.pipe.client, stream, &bytes, false),
+                Ok(bytes.len())
+            );
+
+            s.advance().ok();
+        }
+
+        assert_eq!(
+            s.client.send_body(&mut s.pipe.client, stream, &bytes, true),
+            Ok(bytes.len() - 2)
+        );
+
+        s.advance().ok();
+
+        let mut recv_buf = vec![0; bytes.len()];
+
+        assert_eq!(s.poll_server(), Ok((stream, Event::Headers(req))));
+
+        for _ in 0..total_data_frames {
+            assert_eq!(s.poll_server(), Ok((stream, Event::Data)));
+            assert_eq!(
+                s.recv_body_server(stream, &mut recv_buf),
+                Ok(bytes.len())
+            );
+        }
+
+        assert_eq!(s.poll_server(), Ok((stream, Event::Data)));
+        assert_eq!(
+            s.recv_body_server(stream, &mut recv_buf),
+            Ok(bytes.len() - 2)
+        );
+
+        // Fin flag from last send_body() call was not sent as the buffer was
+        // only partially written.
+        assert_eq!(s.poll_server(), Err(Error::Done));
     }
 }
 

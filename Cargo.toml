@@ -20,10 +20,16 @@ exclude = [
 ]
 
 [features]
-no_bssl = []
+default = ["boringssl-vendored"]
+
+# Build vendored BoringSSL library.
+boringssl-vendored = []
+
+# Generate pkg-config metadata file for libquiche.
+pkg-config-meta = []
 
 [package.metadata.docs.rs]
-features = ["no_bssl"]
+default-features = false
 
 [build-dependencies]
 cmake = "0.1"
@@ -31,11 +37,11 @@ cmake = "0.1"
 [dependencies]
 log = "0.4"
 libc = "0.2"
-ring = "0.14"
+ring = "0.16"
 lazy_static = "1"
 
 [target."cfg(windows)".dependencies]
-winapi = {version = "0.3", features = ["wincrypt"] }
+winapi = { version = "0.3", features = ["wincrypt"] }
 
 [dev-dependencies]
 mio = "0.6"

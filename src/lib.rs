@@ -608,20 +608,20 @@ pub struct Connection {
     sent_count: usize,
 
     /// Total number of bytes received from the peer.
-    rx_data: usize,
+    rx_data: u64,
 
     /// Local flow control limit for the connection.
-    max_rx_data: usize,
+    max_rx_data: u64,
 
     /// Updated local flow control limit for the connection. This is used to
     /// trigger sending MAX_DATA frames after a certain threshold.
-    max_rx_data_next: usize,
+    max_rx_data_next: u64,
 
     /// Total number of bytes sent to the peer.
-    tx_data: usize,
+    tx_data: u64,
 
     /// Peer's flow control limit for the connection.
-    max_tx_data: usize,
+    max_tx_data: u64,
 
     /// Total number of bytes the server can send before the peer's address
     /// is verified.
@@ -888,8 +888,8 @@ impl Connection {
             sent_count: 0,
 
             rx_data: 0,
-            max_rx_data: max_rx_data as usize,
-            max_rx_data_next: max_rx_data as usize,
+            max_rx_data,
+            max_rx_data_next: max_rx_data,
 
             tx_data: 0,
             max_tx_data: 0,
@@ -947,11 +947,11 @@ impl Connection {
         conn.handshake.init(&conn).map_err(|_| Error::TlsFail)?;
 
         conn.streams.update_local_max_streams_bidi(
-            config.local_transport_params.initial_max_streams_bidi as usize,
+            config.local_transport_params.initial_max_streams_bidi,
         );
 
         conn.streams.update_local_max_streams_uni(
-            config.local_transport_params.initial_max_streams_uni as usize,
+            config.local_transport_params.initial_max_streams_uni,
         );
 
         // Derive initial secrets for the client. We can do this here because
@@ -1390,10 +1390,27 @@ impl Connection {
 
     /// Writes a single QUIC packet to be sent to the peer.
     ///
-    /// On success the number of bytes processed from the input buffer is
-    /// returned, or [`Done`].
+    /// On success the number of bytes written to the output buffer is
+    /// returned, or [`Done`] if there was nothing to write.
+    ///
+    /// The application should call `send()` multiple times until [`Done`] is
+    /// returned, indicating that there are no more packets to send. It is
+    /// recommended that `send()` be called in the following cases:
+    ///
+    ///  * When the application receives QUIC packets from the peer (that is,
+    ///    any time [`recv()`] is also called).
+    ///
+    ///  * When the connection timer expires (that is, any time [`on_timeout()`]
+    ///    is also called).
+    ///
+    ///  * When the application sends data to the peer (for examples, any time
+    ///    [`stream_send()`] or [`stream_shutdown()`] are called).
     ///
     /// [`Done`]: enum.Error.html#variant.Done
+    /// [`recv()`]: struct.Connection.html#method.recv
+    /// [`on_timeout()`]: struct.Connection.html#method.on_timeout
+    /// [`stream_send()`]: struct.Connection.html#method.stream_send
+    /// [`stream_shutdown()`]: struct.Connection.html#method.stream_shutdown
     ///
     /// ## Examples:
     ///
@@ -1477,16 +1494,16 @@ impl Connection {
                     // TODO: due to a packet loss edge case the following could
                     // go negative, though it's not clear why, so will need to
                     // figure it out.
-                    self.tx_data = self.tx_data.saturating_sub(data.len());
+                    self.tx_data = self.tx_data.saturating_sub(data.len() as u64);
 
-                    let was_writable = stream.writable();
+                    let was_flushable = stream.flushable();
 
                     stream.send.push(data)?;
 
-                    // If the stream is now writable push it to the writable
+                    // If the stream is now flushable push it to the flushable
                     // queue, but only if it wasn't already queued.
-                    if stream.writable() && !was_writable {
-                        self.streams.push_writable(stream_id);
+                    if stream.flushable() && !was_flushable {
+                        self.streams.push_flushable(stream_id);
                     }
                 },
 
@@ -1575,7 +1592,7 @@ impl Connection {
             !is_closing
         {
             let frame = frame::Frame::MaxData {
-                max: self.max_rx_data_next as u64,
+                max: self.max_rx_data_next,
             };
 
             if frame.wire_len() <= left {
@@ -1689,7 +1706,7 @@ impl Connection {
         }
 
         // Create CRYPTO frame.
-        if self.pkt_num_spaces[epoch].crypto_stream.writable() &&
+        if self.pkt_num_spaces[epoch].crypto_stream.flushable() &&
             left > frame::MAX_CRYPTO_OVERHEAD &&
             !is_closing
         {
@@ -1711,19 +1728,19 @@ impl Connection {
             is_crypto = true;
         }
 
-        // Create a single STREAM frame for the first stream that is writable.
+        // Create a single STREAM frame for the first stream that is flushable.
         if pkt_type == packet::Type::Application &&
             self.max_tx_data > self.tx_data &&
             left > frame::MAX_STREAM_OVERHEAD &&
             !is_closing
         {
-            while let Some(stream_id) = self.streams.pop_writable() {
+            while let Some(stream_id) = self.streams.pop_flushable() {
                 let stream = self.streams.get_mut(stream_id).unwrap();
 
                 // Make sure we can fit the data in the packet.
                 let stream_len = cmp::min(
                     left - frame::MAX_STREAM_OVERHEAD,
-                    self.max_tx_data - self.tx_data,
+                    (self.max_tx_data - self.tx_data) as usize,
                 );
 
                 let stream_buf = stream.send.pop(stream_len)?;
@@ -1732,7 +1749,7 @@ impl Connection {
                     continue;
                 }
 
-                self.tx_data += stream_buf.len();
+                self.tx_data += stream_buf.len() as u64;
 
                 let frame = frame::Frame::Stream {
                     stream_id,
@@ -1747,10 +1764,10 @@ impl Connection {
                 ack_eliciting = true;
                 in_flight = true;
 
-                // If the stream is still writable, push it to the back of the
+                // If the stream is still flushable, push it to the back of the
                 // queue again.
-                if stream.writable() {
-                    self.streams.push_writable(stream_id);
+                if stream.flushable() {
+                    self.streams.push_flushable(stream_id);
                 }
 
                 break;
@@ -1902,14 +1919,22 @@ impl Connection {
 
         let (read, fin) = stream.recv.pop(out)?;
 
-        self.max_rx_data_next = self.max_rx_data_next.saturating_add(read);
+        self.max_rx_data_next = self.max_rx_data_next.saturating_add(read as u64);
 
         Ok((read, fin))
     }
 
     /// Writes data to a stream.
     ///
-    /// On success the number of bytes written is returned.
+    /// On success the number of bytes written is returned, or [`Done`] if no
+    /// data was written (e.g. because the stream has no capacity).
+    ///
+    /// Note that in order to avoid buffering an infinite amount of data in the
+    /// stream's send buffer, streams are only allowed to buffer outgoing data
+    /// up to the amount that the peer allows it to send (that is, up to the
+    /// stream's outgoing flow control capacity).
+    ///
+    /// [`Done`]: enum.Error.html#variant.Done
     ///
     /// ## Examples:
     ///
@@ -1938,17 +1963,17 @@ impl Connection {
 
         // TODO: implement backpressure based on peer's flow control
 
-        let was_writable = stream.writable();
+        let was_flushable = stream.flushable();
 
-        stream.send.push_slice(buf, fin)?;
+        let sent = stream.send.push_slice(buf, fin)?;
 
-        // If the stream is now writable push it to the writable queue, but
+        // If the stream is now flushable push it to the flushable queue, but
         // only if it wasn't already queued.
-        if stream.writable() && !was_writable {
-            self.streams.push_writable(stream_id);
+        if stream.flushable() && !was_flushable {
+            self.streams.push_flushable(stream_id);
         }
 
-        Ok(buf.len())
+        Ok(sent)
     }
 
     /// Shuts down reading or writing from/to the specified stream.
@@ -1985,6 +2010,15 @@ impl Connection {
         Ok(())
     }
 
+    /// Returns the stream's outgoing flow control capacity in bytes.
+    pub fn stream_capacity(&self, stream_id: u64) -> Result<usize> {
+        if let Some(stream) = self.streams.get(stream_id) {
+            return Ok(stream.send.cap());
+        };
+
+        Err(Error::InvalidStreamState)
+    }
+
     /// Returns true if all the data has been read from the specified stream.
     ///
     /// This instructs the application that all the data received from the
@@ -2002,7 +2036,12 @@ impl Connection {
         stream.recv.is_fin()
     }
 
-    /// Creates an iterator over streams that have outstanding data to read.
+    /// Returns an iterator over streams that have outstanding data to read.
+    ///
+    /// Note that the iterator will only include streams that were readable at
+    /// the time the iterator itself was created (i.e. when `readable()` was
+    /// called). To account for newly readable streams, the iterator needs to
+    /// be created again.
     ///
     /// ## Examples:
     ///
@@ -2013,9 +2052,7 @@ impl Connection {
     /// # let scid = [0xba; 16];
     /// # let mut conn = quiche::accept(&scid, None, &mut config)?;
     /// // Iterate over readable streams.
-    /// let streams: Vec<u64> = conn.readable().collect();
-    ///
-    /// for stream_id in streams {
+    /// for stream_id in conn.readable() {
     ///     // Stream is readable, read until there's no more data.
     ///     while let Ok((read, fin)) = conn.stream_recv(stream_id, &mut buf) {
     ///         println!("Got {} bytes on stream {}", read, stream_id);
@@ -2023,8 +2060,47 @@ impl Connection {
     /// }
     /// # Ok::<(), quiche::Error>(())
     /// ```
-    pub fn readable(&mut self) -> Readable {
+    pub fn readable(&self) -> StreamIter {
         self.streams.readable()
+    }
+
+    /// Returns an iterator over streams that can be written to.
+    ///
+    /// A "writable" stream is a stream that has enough flow control capacity to
+    /// send data to the peer. To avoid buffering an infinite amount of data,
+    /// streams are only allowed to buffer outgoing data up to the amount that
+    /// the peer allows to send.
+    ///
+    /// Note that the iterator will only include streams that were writable at
+    /// the time the iterator itself was created (i.e. when `writable()` was
+    /// called). To account for newly writable streams, the iterator needs to
+    /// be created again.
+    ///
+    /// ## Examples:
+    ///
+    /// ```no_run
+    /// # let mut buf = [0; 512];
+    /// # let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    /// # let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION)?;
+    /// # let scid = [0xba; 16];
+    /// # let mut conn = quiche::accept(&scid, None, &mut config)?;
+    /// // Iterate over writable streams.
+    /// for stream_id in conn.writable() {
+    ///     // Stream is writable, write some data.
+    ///     if let Ok(written) = conn.stream_send(stream_id, &buf, false) {
+    ///         println!("Written {} bytes on stream {}", written, stream_id);
+    ///     }
+    /// }
+    /// # Ok::<(), quiche::Error>(())
+    /// ```
+    pub fn writable(&self) -> StreamIter {
+        // If there is not enough connection-level flow control capacity, none
+        // of the streams are writable, so return an empty iterator.
+        if self.max_tx_data <= self.tx_data {
+            return StreamIter::default();
+        }
+
+        self.streams.writable()
     }
 
     /// Returns the amount of time until the next timeout event.
@@ -2200,13 +2276,13 @@ impl Connection {
                         return Err(Error::InvalidTransportParam);
                     }
 
-                    self.max_tx_data = peer_params.initial_max_data as usize;
+                    self.max_tx_data = peer_params.initial_max_data;
 
                     self.streams.update_peer_max_streams_bidi(
-                        peer_params.initial_max_streams_bidi as usize,
+                        peer_params.initial_max_streams_bidi,
                     );
                     self.streams.update_peer_max_streams_uni(
-                        peer_params.initial_max_streams_uni as usize,
+                        peer_params.initial_max_streams_uni,
                     );
 
                     self.recovery.max_ack_delay =
@@ -2274,9 +2350,9 @@ impl Connection {
             }
         }
 
-        // If there are writable streams, use Application.
+        // If there are flushable streams, use Application.
         if self.handshake_completed &&
-            (self.streams.has_writable() || self.streams.has_out_of_credit())
+            (self.streams.has_flushable() || self.streams.has_out_of_credit())
         {
             return Ok(packet::EPOCH_APPLICATION);
         }
@@ -2351,7 +2427,7 @@ impl Connection {
                 // Get existing stream or create a new one.
                 let stream = self.get_or_create_stream(stream_id, false)?;
 
-                self.rx_data += stream.recv.reset(final_size as usize)?;
+                self.rx_data += stream.recv.reset(final_size)? as u64;
 
                 if self.rx_data > self.max_rx_data {
                     return Err(Error::FlowControl);
@@ -2401,7 +2477,7 @@ impl Connection {
                 }
 
                 // Check for flow control limits.
-                let data_len = data.len();
+                let data_len = data.len() as u64;
 
                 if self.rx_data + data_len > self.max_rx_data {
                     return Err(Error::FlowControl);
@@ -2416,21 +2492,21 @@ impl Connection {
             },
 
             frame::Frame::MaxData { max } => {
-                self.max_tx_data = cmp::max(self.max_tx_data, max as usize);
+                self.max_tx_data = cmp::max(self.max_tx_data, max);
             },
 
             frame::Frame::MaxStreamData { stream_id, max } => {
                 // Get existing stream or create a new one.
                 let stream = self.get_or_create_stream(stream_id, false)?;
 
-                let was_writable = stream.writable();
+                let was_flushable = stream.flushable();
 
-                stream.send.update_max_data(max as usize);
+                stream.send.update_max_data(max);
 
-                // If the stream is now writable push it to the writable queue,
+                // If the stream is now flushable push it to the flushable queue,
                 // but only if it wasn't already queued.
-                if stream.writable() && !was_writable {
-                    self.streams.push_writable(stream_id);
+                if stream.flushable() && !was_flushable {
+                    self.streams.push_flushable(stream_id);
                 }
             },
 
@@ -2439,7 +2515,7 @@ impl Connection {
                     return Err(Error::StreamLimit);
                 }
 
-                self.streams.update_peer_max_streams_bidi(max as usize);
+                self.streams.update_peer_max_streams_bidi(max);
             },
 
             frame::Frame::MaxStreamsUni { max } => {
@@ -2447,7 +2523,7 @@ impl Connection {
                     return Err(Error::StreamLimit);
                 }
 
-                self.streams.update_peer_max_streams_uni(max as usize);
+                self.streams.update_peer_max_streams_uni(max);
             },
 
             frame::Frame::DataBlocked { .. } => (),
@@ -3511,47 +3587,6 @@ mod tests {
     }
 
     #[test]
-    /// Tests that sending STREAM frames for a stream that is out of flow
-    /// control credits is resumed when the stream receives more credits.
-    fn stream_flow_control_resume_send_after_update() {
-        let mut buf = [0; 65535];
-
-        let mut pipe = testing::Pipe::default().unwrap();
-
-        assert_eq!(pipe.handshake(&mut buf), Ok(()));
-
-        assert_eq!(pipe.client.stream_send(4, b"aaaaa", false), Ok(5));
-        assert_eq!(pipe.client.stream_send(4, b"aaaaa", false), Ok(5));
-        assert_eq!(pipe.client.stream_send(4, b"aaaaa", false), Ok(5));
-        assert_eq!(pipe.client.stream_send(4, b"aaaaa", true), Ok(5));
-
-        assert_eq!(pipe.advance(&mut buf), Ok(()));
-
-        assert!(!pipe.server.stream_finished(4));
-
-        let mut r = pipe.server.readable();
-        assert_eq!(r.next(), Some(4));
-        assert_eq!(r.next(), None);
-
-        let mut b = [0; 20];
-        assert_eq!(pipe.server.stream_recv(4, &mut b), Ok((15, false)));
-        assert_eq!(&b[..15], b"aaaaaaaaaaaaaaa");
-
-        assert_eq!(pipe.advance(&mut buf), Ok(()));
-
-        assert!(!pipe.server.stream_finished(4));
-
-        let mut r = pipe.server.readable();
-        assert_eq!(r.next(), Some(4));
-        assert_eq!(r.next(), None);
-
-        assert_eq!(pipe.server.stream_recv(4, &mut b), Ok((5, true)));
-        assert_eq!(&b[..5], b"aaaaa");
-
-        assert!(pipe.server.stream_finished(4));
-    }
-
-    #[test]
     fn stream_flow_control_update() {
         let mut buf = [0; 65535];
 
@@ -3998,7 +4033,7 @@ mod tests {
         let mut r = pipe.server.readable();
         assert_eq!(r.next(), None);
 
-        assert_eq!(pipe.client.stream_send(4, b"hello, world", false), Ok(12));
+        assert_eq!(pipe.client.stream_send(4, b"bye", false), Ok(3));
         assert_eq!(pipe.advance(&mut buf), Ok(()));
 
         let mut r = pipe.server.readable();
@@ -4023,14 +4058,14 @@ mod tests {
         let mut b = [0; 15];
         pipe.server.stream_recv(4, &mut b).unwrap();
 
-        assert_eq!(pipe.client.stream_send(4, b"hello, world", false), Ok(12));
+        assert_eq!(pipe.client.stream_send(4, b"a", false), Ok(1));
         assert_eq!(pipe.client.stream_shutdown(4, Shutdown::Write, 0), Ok(()));
         assert_eq!(pipe.advance(&mut buf), Ok(()));
 
         let mut r = pipe.server.readable();
         assert_eq!(r.next(), None);
 
-        assert_eq!(pipe.client.stream_send(4, b"hello, world", false), Ok(12));
+        assert_eq!(pipe.client.stream_send(4, b"bye", false), Ok(3));
         assert_eq!(pipe.advance(&mut buf), Ok(()));
 
         let mut r = pipe.server.readable();
@@ -4038,7 +4073,7 @@ mod tests {
     }
 
     #[test]
-    /// Tests that the order of writable streams scheduled on the wire is the
+    /// Tests that the order of flushable streams scheduled on the wire is the
     /// same as the order of `stream_send()` calls done by the application.
     fn stream_round_robin() {
         let mut buf = [0; 65535];
@@ -4092,6 +4127,154 @@ mod tests {
     }
 
     #[test]
+    /// Tests the readable iterator.
+    fn stream_readable() {
+        let mut buf = [0; 65535];
+
+        let mut pipe = testing::Pipe::default().unwrap();
+
+        assert_eq!(pipe.handshake(&mut buf), Ok(()));
+
+        // No readable streams.
+        let mut r = pipe.client.readable();
+        assert_eq!(r.next(), None);
+
+        assert_eq!(pipe.client.stream_send(4, b"aaaaa", false), Ok(5));
+
+        let mut r = pipe.client.readable();
+        assert_eq!(r.next(), None);
+
+        assert_eq!(pipe.advance(&mut buf), Ok(()));
+
+        // Server received stream.
+        let mut r = pipe.server.readable();
+        assert_eq!(r.next(), Some(4));
+        assert_eq!(r.next(), None);
+
+        assert_eq!(
+            pipe.server.stream_send(4, b"aaaaaaaaaaaaaaa", false),
+            Ok(15)
+        );
+        assert_eq!(pipe.advance(&mut buf), Ok(()));
+
+        let mut r = pipe.client.readable();
+        assert_eq!(r.next(), Some(4));
+        assert_eq!(r.next(), None);
+
+        // Client drains stream.
+        let mut b = [0; 15];
+        pipe.client.stream_recv(4, &mut b).unwrap();
+        assert_eq!(pipe.advance(&mut buf), Ok(()));
+
+        let mut r = pipe.client.readable();
+        assert_eq!(r.next(), None);
+
+        // Server suts down stream.
+        let mut r = pipe.server.readable();
+        assert_eq!(r.next(), Some(4));
+        assert_eq!(r.next(), None);
+
+        assert_eq!(pipe.server.stream_shutdown(4, Shutdown::Read, 0), Ok(()));
+
+        let mut r = pipe.server.readable();
+        assert_eq!(r.next(), None);
+
+        // Client creates multiple streams.
+        assert_eq!(pipe.client.stream_send(8, b"aaaaa", false), Ok(5));
+        assert_eq!(pipe.advance(&mut buf), Ok(()));
+
+        assert_eq!(pipe.client.stream_send(12, b"aaaaa", false), Ok(5));
+        assert_eq!(pipe.advance(&mut buf), Ok(()));
+
+        let mut r = pipe.server.readable();
+        assert_eq!(r.len(), 2);
+
+        assert!(r.next().is_some());
+        assert!(r.next().is_some());
+        assert!(r.next().is_none());
+
+        assert_eq!(r.len(), 0);
+    }
+
+    #[test]
+    /// Tests the writable iterator.
+    fn stream_writable() {
+        let mut buf = [0; 65535];
+
+        let mut pipe = testing::Pipe::default().unwrap();
+
+        assert_eq!(pipe.handshake(&mut buf), Ok(()));
+
+        // No writable streams.
+        let mut w = pipe.client.writable();
+        assert_eq!(w.next(), None);
+
+        assert_eq!(pipe.client.stream_send(4, b"aaaaa", false), Ok(5));
+
+        // Client created stream.
+        let mut w = pipe.client.writable();
+        assert_eq!(w.next(), Some(4));
+        assert_eq!(w.next(), None);
+
+        assert_eq!(pipe.advance(&mut buf), Ok(()));
+
+        // Server created stream.
+        let mut w = pipe.server.writable();
+        assert_eq!(w.next(), Some(4));
+        assert_eq!(w.next(), None);
+
+        assert_eq!(
+            pipe.server.stream_send(4, b"aaaaaaaaaaaaaaa", false),
+            Ok(15)
+        );
+
+        // Server stream is full.
+        let mut w = pipe.server.writable();
+        assert_eq!(w.next(), None);
+
+        assert_eq!(pipe.advance(&mut buf), Ok(()));
+
+        // Client drains stream.
+        let mut b = [0; 15];
+        pipe.client.stream_recv(4, &mut b).unwrap();
+        assert_eq!(pipe.advance(&mut buf), Ok(()));
+
+        // Server stream is writable again.
+        let mut w = pipe.server.writable();
+        assert_eq!(w.next(), Some(4));
+        assert_eq!(w.next(), None);
+
+        // Server suts down stream.
+        assert_eq!(pipe.server.stream_shutdown(4, Shutdown::Write, 0), Ok(()));
+
+        let mut w = pipe.server.writable();
+        assert_eq!(w.next(), None);
+
+        // Client creates multiple streams.
+        assert_eq!(pipe.client.stream_send(8, b"aaaaa", false), Ok(5));
+        assert_eq!(pipe.advance(&mut buf), Ok(()));
+
+        assert_eq!(pipe.client.stream_send(12, b"aaaaa", false), Ok(5));
+        assert_eq!(pipe.advance(&mut buf), Ok(()));
+
+        let mut w = pipe.server.writable();
+        assert_eq!(w.len(), 2);
+
+        assert!(w.next().is_some());
+        assert!(w.next().is_some());
+        assert!(w.next().is_none());
+
+        assert_eq!(w.len(), 0);
+
+        // Server finishes stream.
+        assert_eq!(pipe.server.stream_send(12, b"aaaaa", true), Ok(5));
+
+        let mut w = pipe.server.writable();
+        assert_eq!(w.next(), Some(8));
+        assert_eq!(w.next(), None);
+    }
+
+    #[test]
     /// Tests that we don't exceed the per-connection flow control limit set by
     /// the peer.
     fn flow_control_limit_send() {
@@ -4123,7 +4306,7 @@ mod tests {
 
 pub use crate::packet::Header;
 pub use crate::packet::Type;
-pub use crate::stream::Readable;
+pub use crate::stream::StreamIter;
 
 mod crypto;
 mod ffi;
